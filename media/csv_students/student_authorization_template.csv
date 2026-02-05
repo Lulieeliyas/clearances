@@ -1,0 +1,16 @@
+first_name,last_name,id_number
+John,Doe,STU001
+Jane,Smith,STU002
+Michael,Johnson,STU003
+
+Instructions:
+1. First Name: Student's first name (case-insensitive match)
+2. Last Name: Student's last name (case-insensitive match)
+3. ID Number: Student's ID number (exact match)
+
+Important:
+- Do not change the header row
+- All 3 fields are required
+- ID number must be unique
+- First and last names will be matched case-insensitively
+- Students will provide email, college, and department during registration
