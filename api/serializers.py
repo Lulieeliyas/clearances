@@ -12,18 +12,25 @@ from .models import (
     User, ClearanceForm, Department, College,
     SystemControl, PasswordResetOTP, Notification,
     SystemControlRequest, FormAccessRequest,
-    ClearanceFormStatusHistory, ChatRoom, Message,AuthorizedStudent,CSVStudentUpload
+    ClearanceFormStatusHistory, ChatRoom, Message,AuthorizedStudent,CSVStudentUpload,Building  
 )
 
 User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
     department = serializers.SerializerMethodField()
-    password = serializers.CharField(write_only=True, required=True)
-    
+    password = serializers.CharField(write_only=True, required=False)
+    building_info = serializers.SerializerMethodField()
+    assigned_buildings_info = serializers.SerializerMethodField()
+    assigned_buildings_details = serializers.SerializerMethodField()
     class Meta:
         model = User
-        fields = ['id', 'username', 'email', 'password', 'role', 'department', 'is_blocked']
+        fields = [
+            'id', 'username', 'email', 'password', 'role', 
+            'department', 'is_blocked', 'building', 'building_info',
+            'assigned_buildings', 'assigned_buildings_info', 'assigned_buildings_details',
+            'first_name', 'last_name', 'phone'
+        ]
         read_only_fields = ['created_at']
 
     def get_department(self, obj):
@@ -35,6 +42,69 @@ class UserSerializer(serializers.ModelSerializer):
             }
         return None
 
+
+    def get_building_info(self, obj):
+        """Get student's residential building info"""
+        if obj.building:
+            return {
+                "id": obj.building.id,
+                "name": obj.building.name,
+                "code": obj.building.code
+            }
+        return None
+    
+    def get_assigned_buildings_info(self, obj):
+        """Get buildings assigned to dormitory staff"""
+        if obj.role == 'dormitory':
+            buildings = obj.assigned_buildings.all()
+            return [
+                {
+                    "id": b.id,
+                    "name": b.name,
+                    "code": b.code,
+                    "capacity": b.capacity,
+                    "student_count": b.building_students.filter(is_active=True).count()
+                }
+                for b in buildings
+            ]
+        return []
+
+    def get_assigned_buildings_details(self, obj):
+        """Get detailed building info with student counts"""
+        if obj.role == 'dormitory':
+            buildings = obj.assigned_buildings.all()
+            details = []
+            for building in buildings:
+                students = User.objects.filter(
+                    role='student',
+                    building=building,
+                    is_active=True
+                )
+                details.append({
+                    "id": building.id,
+                    "name": building.name,
+                    "code": building.code,
+                    "capacity": building.capacity,
+                    "student_count": students.count(),
+                    "students": [
+                        {
+                            "id": s.id,
+                            "username": s.username,
+                            "full_name": s.get_full_name(),
+                            "email": s.email,
+                            "id_number": s.id_number
+                        }
+                        for s in students[:10]  # Limit to 10 students for performance
+                    ],
+                    "pending_forms": ClearanceForm.objects.filter(
+                        student__in=students,
+                        status="approved_studentaffairs"
+                    ).count()
+                })
+            return details
+        return []
+
+
     def create(self, validated_data):
         password = validated_data.pop("password")
         user = User(**validated_data)
@@ -42,6 +112,39 @@ class UserSerializer(serializers.ModelSerializer):
         user.save()
         return user
 
+
+
+# In your serializers.py - Add this new serializer
+
+class DormitoryStaffAssignmentSerializer(serializers.Serializer):
+    """Serializer for assigning buildings to dormitory staff"""
+    staff_id = serializers.IntegerField(required=True)
+    building_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=True,
+        allow_empty=True
+    )
+    
+    def validate_staff_id(self, value):
+        try:
+            staff = User.objects.get(id=value, role='dormitory')
+            return value
+        except User.DoesNotExist:
+            raise serializers.ValidationError("Dormitory staff not found")
+    
+    def validate_building_ids(self, value):
+        if not value:
+            return value  # Allow empty list (unassign all)
+        
+        # Validate all buildings exist and are active
+        buildings = Building.objects.filter(id__in=value, is_active=True)
+        if buildings.count() != len(value):
+            found_ids = set(buildings.values_list('id', flat=True))
+            missing_ids = set(value) - found_ids
+            raise serializers.ValidationError(
+                f"Buildings not found or inactive: {list(missing_ids)}"
+            )
+        return value
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=6)
     confirm_password = serializers.CharField(write_only=True)
@@ -57,13 +160,19 @@ class RegisterSerializer(serializers.ModelSerializer):
         queryset=Department.objects.all(),
         required=True
     )
+     # Add building field - IMPORTANT: Building must be imported at the top
+    building = serializers.PrimaryKeyRelatedField(
+        queryset=Building.objects.filter(is_active=True),  # Only show active buildings
+        required=True,
+        help_text="Select your dormitory building"
+    )
     
     class Meta:
         model = User
         fields = [
             'id', 'username', 'email', 'password', 'confirm_password',
             'first_name', 'last_name', 'role', 'id_number',
-            'college', 'department'
+            'college', 'department','building'
         ]
         extra_kwargs = {
             'username': {'required': False},  # We'll generate it automatically
@@ -85,6 +194,11 @@ class RegisterSerializer(serializers.ModelSerializer):
         if User.objects.filter(id_number=id_number).exists():
             raise serializers.ValidationError({"id_number": "This ID number is already registered."})
         
+        
+         # Validate building is active
+        building = data.get('building')
+        if building and not building.is_active:
+            raise serializers.ValidationError({"building": "Selected building is not active."})
         # Generate username if not provided
         if not data.get('username'):
             first_name = data.get('first_name', '').lower().replace(' ', '_')
@@ -172,7 +286,30 @@ class ChangePasswordSerializer(serializers.Serializer):
             raise serializers.ValidationError("Password must contain at least one special character.")
         return value
 
+# buildig create
 
+class BuildingSerializer(serializers.ModelSerializer):
+    student_count = serializers.SerializerMethodField()
+    staff_count = serializers.SerializerMethodField()
+    form_count = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Building
+        fields = [
+            'id', 'name', 'code', 'address', 'capacity',
+            'is_active', 'student_count', 'staff_count', 'form_count',
+            'created_at'
+        ]
+        read_only_fields = ['created_at']
+    
+    def get_student_count(self, obj):
+        return obj.building_students.filter(is_active=True).count()
+    
+    def get_staff_count(self, obj):
+        return obj.assigned_staff.count()
+    
+    def get_form_count(self, obj):
+        return obj.form_buildings.filter(status='approved_studentaffairs').count()
 class ProfilePictureSerializer(serializers.ModelSerializer):
     profile_picture_url = serializers.SerializerMethodField()
     
@@ -220,7 +357,7 @@ class ClearanceFormStatusHistorySerializer(serializers.ModelSerializer):
 class ClearanceFormSerializer(serializers.ModelSerializer):
     student = UserSerializer(read_only=True)
     status_history = ClearanceFormStatusHistorySerializer(many=True, read_only=True)
-    
+    student_building_info = serializers.SerializerMethodField()
     class Meta:
         model = ClearanceForm
         fields = "__all__"
@@ -228,6 +365,16 @@ class ClearanceFormSerializer(serializers.ModelSerializer):
             "status", "created_at",
             "updated_at", "cleared_at"
         ]
+        
+    def get_student_building_info(self, obj):
+        """Get student building information"""
+        if obj.student_building:
+            return {
+                "id": obj.student_building.id,
+                "name": obj.student_building.name,
+                "code": obj.student_building.code
+            }
+        return None
 
     def create(self, validated_data):
         # keep department_name as provided
@@ -312,33 +459,102 @@ class NotificationSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class MessageSerializer(serializers.ModelSerializer):
+    """Serializer for Message model - FIXED VERSION"""
+    sender = UserSerializer(read_only=True)
+    sender_name = serializers.SerializerMethodField()
+    room = serializers.PrimaryKeyRelatedField(read_only=True)
+    file_url = serializers.SerializerMethodField()
+    thumbnail_url = serializers.SerializerMethodField()
+    is_own = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Message
+        fields = [
+            'id', 'room', 'sender', 'sender_name', 'content', 'message_type',
+            'file', 'audio_file', 'video_file', 'image_file',
+            'file_url', 'thumbnail_url', 'file_name', 'file_size', 'duration',
+            'is_read', 'created_at', 'updated_at', 'is_own'
+        ]
+        read_only_fields = ['created_at', 'updated_at', 'is_read']
+
+    def get_sender_name(self, obj):
+        return obj.sender.get_full_name() or obj.sender.username
+
+    def get_file_url(self, obj):
+        return obj.get_file_url() if hasattr(obj, 'get_file_url') else None
+
+    def get_thumbnail_url(self, obj):
+        if hasattr(obj, 'thumbnail') and obj.thumbnail:
+            return obj.thumbnail.url
+        return None
+
+    def get_is_own(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            return obj.sender == request.user
+        return False
 
 
-# Add these serializers to your serializers.py
-# In serializers.py
+# api/serializers.py
+
 class ChatRoomSerializer(serializers.ModelSerializer):
+    """Serializer for ChatRoom model - FIXED VERSION"""
     participants = UserSerializer(many=True, read_only=True)
+    participants_count = serializers.SerializerMethodField()
     student = UserSerializer(read_only=True)
     specific_staff = UserSerializer(read_only=True)
     department = DepartmentSerializer(read_only=True)
     
-    class Meta:
-        model = ChatRoom
-        fields = ['id', 'name', 'room_type', 'student', 'department', 
-                  'specific_staff', 'participants', 'is_active', 
-                  'last_message_time', 'created_at', 'updated_at']
-        read_only_fields = ['created_at', 'updated_at']
-
-class MessageSerializer(serializers.ModelSerializer):
-    sender = UserSerializer(read_only=True)
-    room = ChatRoomSerializer(read_only=True)
+    # FIX: Use string for last_message to match React expectation
+    last_message = serializers.SerializerMethodField()
+    last_message_time = serializers.DateTimeField(read_only=True)
+    unread_count = serializers.SerializerMethodField()
+    other_participant = serializers.SerializerMethodField()
     
     class Meta:
-        model = Message
-        fields = ['id', 'room', 'sender', 'content', 'file', 
-                  'is_read', 'created_at', 'updated_at']
-        read_only_fields = ['created_at', 'updated_at', 'is_read']
+        model = ChatRoom
+        fields = [
+            'id', 'name', 'room_type', 'student', 'department',
+            'specific_staff', 'participants', 'participants_count',
+            'is_active', 'last_message', 'last_message_time',
+            'unread_count', 'other_participant',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
 
+    def get_participants_count(self, obj):
+        return obj.participants.count()
+
+    def get_last_message(self, obj):
+        """Return just the content as string - NOT an object"""
+        last_msg = obj.messages.last()
+        if last_msg:
+            # Return ONLY the string content, not an object
+            return last_msg.content[:100] if last_msg.content else f"[{last_msg.message_type}]"
+        return ""
+
+    def get_unread_count(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            return obj.messages.filter(
+                is_read=False
+            ).exclude(sender=request.user).count()
+        return 0
+
+    def get_other_participant(self, obj):
+        request = self.context.get('request')
+        if request and request.user:
+            other = obj.participants.exclude(id=request.user.id).first()
+            if other:
+                return {
+                    'id': other.id,
+                    'username': other.username,
+                    'full_name': other.get_full_name(),
+                    'role': other.role,
+                    'department': other.department.name if other.department else None,
+                }
+        return None
 class PaymentMethodSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentMethod
@@ -348,6 +564,61 @@ class PaymentMethodSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+    
+    def validate(self, data):
+        # Get the name
+        name = data.get('name')
+        if not name and self.instance:
+            name = self.instance.name
+        
+        # Get account number
+        account_number = data.get('account_number')
+        if account_number is None and self.instance:
+            account_number = self.instance.account_number
+        
+        # Skip if no account number
+        if account_number is None or not account_number:
+            return data
+        
+        account_str = str(account_number).strip()
+        name_lower = name.lower() if name else ''
+        
+        # Check for CBE (Commercial Bank of Ethiopia) variations
+        cbe_patterns = ['cbe', 'commercial bank', 'commercial bank of ethiopia']
+        is_cbe = any(pattern in name_lower for pattern in cbe_patterns)
+        
+        # Check for Nib International Bank variations
+        nib_patterns = ['nib', 'nib international', 'nib bank', 'nib international bank']
+        is_nib = any(pattern in name_lower for pattern in nib_patterns)
+        
+        # Validate digits only
+        if not account_str.isdigit():
+            raise serializers.ValidationError({
+                "account_number": "Account number must contain only digits."
+            })
+        
+        # CBE validation - exactly 13 digits
+        if is_cbe:
+            if len(account_str) != 13:
+                raise serializers.ValidationError({
+                    "account_number": f"CBE account number must be exactly 13 digits. You provided {len(account_str)} digits."
+                })
+        
+        # Nib International Bank validation - exactly 13 digits
+        elif is_nib:
+            if len(account_str) != 13:
+                raise serializers.ValidationError({
+                    "account_number": f"Nib International Bank account number must be exactly 13 digits. You provided {len(account_str)} digits."
+                })
+        
+        # Other banks - 5-13 digits
+        else:
+            if len(account_str) < 5 or len(account_str) > 13:
+                raise serializers.ValidationError({
+                    "account_number": f"Account number must be between 5 and 13 digits. You provided {len(account_str)} digits."
+                })
+        
+        return data
 
 class StudentPaymentSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source='student.get_full_name', read_only=True)

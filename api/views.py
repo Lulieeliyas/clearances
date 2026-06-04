@@ -7,13 +7,17 @@ from rest_framework.views import APIView
 from django.shortcuts import render
 from django.shortcuts import render
 from .decorators import system_open_required
-from .models import User, ClearanceForm, Notification, ClearanceFormStatusHistory, Department, College, SystemControl, PasswordResetOTP,AuthorizedStudent,CSVStudentUpload
+from .models import User, ClearanceForm, Notification, ClearanceFormStatusHistory, Department, College, SystemControl, PasswordResetOTP,AuthorizedStudent,CSVStudentUpload,Building
 from .serializers import (
     UserSerializer, RegisterSerializer, ClearanceFormSerializer,
     DepartmentSerializer, CollegeSerializer, SystemControlSerializer,
-    ChangeProfileSerializer, AdminCreateUserSerializer, ChatRoomSerializer, MessageSerializer,CSVUploadSerializer,AuthorizedStudentSerializer
+    ChangeProfileSerializer, AdminCreateUserSerializer, ChatRoomSerializer, MessageSerializer,CSVUploadSerializer,AuthorizedStudentSerializer,BuildingSerializer
 )
 
+from django.db.models import Count, Prefetch
+from django.utils import timezone
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from django.http import StreamingHttpResponse, FileResponse
 from rest_framework.decorators import action
 from .models import PaymentMethod, StudentPayment, PaymentVerificationLog
 from .serializers import (
@@ -46,11 +50,11 @@ from time import sleep
 from django.db.models import Sum
 from PIL import Image
 import base64
-
+import mimetypes
 import qrcode
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-
+import time
 from django.core.files.base import ContentFile
 from io import BytesIO
 from django.db import transaction
@@ -92,7 +96,6 @@ class IsAuthenticatedOrReadOnlyForPublic(permissions.BasePermission):
         return request.user and request.user.is_authenticated
 
 # ==================== AUTH VIEWS ====================
-# In your views.py, update the RegisterView class
 
 class RegisterView(APIView):
     permission_classes = [AllowAny]
@@ -107,33 +110,49 @@ class RegisterView(APIView):
         try:
             data = request.data.copy()
             
-            # Extract the 3 required fields for matching
-            first_name = data.get("first_name", "").strip()
-            last_name = data.get("last_name", "").strip()
+            # Extract student ID for verification
             id_number = data.get("id_number", "").strip()
             
-            if not first_name or not last_name or not id_number:
+            if not id_number:
                 return Response({
-                    "error": "First name, last name, and ID number are required"
+                    "error": "Student ID is required"
                 }, status=400)
             
-            # Check if student is in authorized list - EXACT MATCH ON 3 FIELDS
+            # Check if student is in authorized list by ID ONLY
             authorized_student = AuthorizedStudent.objects.filter(
-                first_name__iexact=first_name,  # Case-insensitive match
-                last_name__iexact=last_name,     # Case-insensitive match
                 id_number=id_number,
-                is_active=True
+                is_active=True,
+                is_registered=False
             ).first()
             
             if not authorized_student:
                 return Response({
-                    "error": "You are not authorized to register. Please ensure: 1) Your first name, 2) Last name, and 3) Student ID match the authorized list. Contact administration if you believe this is an error."
+                    "error": "You are not authorized to register or already registered"
                 }, status=403)
             
             if authorized_student.is_registered:
                 return Response({
                     "error": "This student is already registered"
                 }, status=400)
+            
+             # Validate building selection
+            building_id = data.get("building")
+            if not building_id:
+                return Response({
+                    "error": "Building selection is required",
+                    "message": "Please select your dormitory building"
+                }, status=400)
+            
+            try:
+                building = Building.objects.get(id=building_id, is_active=True)
+                data['building'] = building.id
+                print(f"Student {id_number} will be assigned to building: {building.name} ({building.code})")
+            except Building.DoesNotExist:
+                return Response({
+                    "error": "Invalid building selection",
+                    "message": "The selected building does not exist or is not active"
+                }, status=400)
+            
             
             # Now validate other registration fields
             email = data.get("email")
@@ -192,13 +211,17 @@ class RegisterView(APIView):
             
             # Generate username if not provided
             if not data.get('username'):
-                username = f"{first_name.lower().replace(' ', '_')}_{last_name.lower().replace(' ', '_')}_{id_number}"
+                username = f"{authorized_student.first_name.lower().replace(' ', '_')}_{authorized_student.last_name.lower().replace(' ', '_')}_{id_number}"
                 # Check if username already exists
                 if User.objects.filter(username=username).exists():
                     # Add timestamp to make it unique
                     timestamp = timezone.now().strftime('%Y%m%d%H%M%S')
-                    username = f"{first_name.lower().replace(' ', '_')}_{last_name.lower().replace(' ', '_')}_{id_number}_{timestamp}"
+                    username = f"{authorized_student.first_name.lower().replace(' ', '_')}_{authorized_student.last_name.lower().replace(' ', '_')}_{id_number}_{timestamp}"
                 data['username'] = username
+            
+            # Use names from authorized student record, not from form
+            data['first_name'] = authorized_student.first_name
+            data['last_name'] = authorized_student.last_name
             
             serializer = RegisterSerializer(data=data)
             
@@ -215,9 +238,36 @@ class RegisterView(APIView):
                 authorized_student.registration_date = timezone.now()
                 authorized_student.save()
                 
+                # Verify building was saved correctly
+                user.refresh_from_db()
+                print(f"✅ Student {user.username} successfully registered:")
+                print(f"   - Building assigned: {user.building.name if user.building else 'None'}")
+                print(f"   - Building ID: {user.building.id if user.building else 'None'}")
+                print(f"   - Building Code: {user.building.code if user.building else 'None'}")
+                
+                # Create notification for dormitory staff about new student
+                dormitory_staff = User.objects.filter(
+                    role='dormitory',
+                    assigned_buildings=user.building,
+                    is_active=True
+                )
+                
+                for staff in dormitory_staff:
+                    Notification.objects.create(
+                        user=staff,
+                        title="New Student Registered",
+                        message=f"Student {user.get_full_name()} has been assigned to {user.building.name}",
+                        notification_type="info"
+                    )
+                
                 return Response({
                     "user": UserSerializer(user).data,
-                    "token": token.key
+                    "token": token.key,
+                    "building": {
+                        "id": user.building.id if user.building else None,
+                        "name": user.building.name if user.building else None,
+                        "code": user.building.code if user.building else None
+                    }
                 }, status=201)
             else:
                 # Return detailed validation errors
@@ -225,14 +275,14 @@ class RegisterView(APIView):
                     "errors": serializer.errors,
                     "message": "Registration failed. Please check your input."
                 }, status=400)
-                
         except Exception as e:
+            print(f"❌ Registration error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return Response({
                 "error": str(e),
                 "message": "An error occurred during registration"
             }, status=400)
-            
-            
             
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -344,7 +394,16 @@ def submit_form(request):
         return Response({"error": "Only students can submit forms"}, status=403)
     
     data = request.data
-
+    # Get student's building
+    student_building = request.user.building
+    if not student_building:
+        return Response({
+            "error": "No building assigned",
+            "message": "You don't have a dormitory building assigned. Please contact admin."
+        }, status=400)
+    
+    print(f"Student {request.user.username} submitting form - Building: {student_building.name} ({student_building.code})")
+     # Create form with building information
     form = ClearanceForm.objects.create(
         student=request.user,
         full_name=data.get("full_name"),
@@ -359,17 +418,129 @@ def submit_form(request):
         year=data.get("year"),
         semester=data.get("semester"),
         reason=data.get("reason"),
+        student_building=student_building,
+        student_building_code=student_building.code if student_building else None
     )
+     # Find dormitory staff assigned to this building
+    dormitory_staff = User.objects.filter(
+        role='dormitory',
+        assigned_buildings=student_building,
+        is_active=True
+    )
+    # Create notification for each dormitory staff
+    for staff in dormitory_staff:
+        Notification.objects.create(
+            user=staff,
+            title="New Clearance Form",
+            message=f"Student {request.user.get_full_name()} from {student_building.name} has submitted a clearance form.",
+            clearance_form=form,
+            notification_type="info"
+        )
+        print(f"Notification sent to dormitory staff: {staff.username}")
 
     return Response(
         {
             "message": "Clearance form submitted successfully",
             "form_id": form.id,
             "status": form.status,
+            "building": {
+                "id": student_building.id if student_building else None,
+                "name": student_building.name if student_building else "No building assigned",
+                "code": student_building.code if student_building else None
+            },
+            "assigned_dormitory_staff": [staff.username for staff in dormitory_staff]
         },
         status=status.HTTP_201_CREATED
     )
+# In your views.py - Add this debug endpoint
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def debug_building_assignments(request):
+    """Debug endpoint to check building assignments"""
+    debug_info = {
+        "buildings": [],
+        "students_without_building": [],
+        "dormitory_staff_without_buildings": [],
+        "building_assignments": []
+    }
+    
+    # Check all buildings
+    buildings = Building.objects.all()
+    for building in buildings:
+        students = User.objects.filter(role='student', building=building, is_active=True)
+        staff = User.objects.filter(role='dormitory', assigned_buildings=building, is_active=True)
+        
+        debug_info["buildings"].append({
+            "id": building.id,
+            "name": building.name,
+            "code": building.code,
+            "is_active": building.is_active,
+            "student_count": students.count(),
+            "assigned_staff_count": staff.count(),
+            "assigned_staff": [s.username for s in staff]
+        })
+    
+    # Check students without buildings
+    students_no_building = User.objects.filter(role='student', building__isnull=True, is_active=True)
+    debug_info["students_without_building"] = [
+        {"id": s.id, "username": s.username, "email": s.email} 
+        for s in students_no_building
+    ]
+    
+    # Check dormitory staff without building assignments
+    staff_no_buildings = User.objects.filter(
+        role='dormitory', 
+        is_active=True
+    ).exclude(assigned_buildings__isnull=False)
+    
+    debug_info["dormitory_staff_without_buildings"] = [
+        {"id": s.id, "username": s.username, "email": s.email} 
+        for s in staff_no_buildings
+    ]
+    
+    # Check form building assignments
+    forms_with_buildings = ClearanceForm.objects.filter(
+        student_building__isnull=False
+    ).select_related('student_building')[:10]
+    
+    for form in forms_with_buildings:
+        debug_info["building_assignments"].append({
+            "form_id": form.id,
+            "student": form.student.username if form.student else "Unknown",
+            "building": form.student_building.name if form.student_building else "None",
+            "building_code": form.student_building_code
+        })
+    
+    return Response(debug_info)
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_active_buildings(request):
+    """Public endpoint for registration form to get available buildings"""
+    try:
+        buildings = Building.objects.filter(is_active=True).annotate(
+            student_count=Count('building_students', distinct=True)
+        ).order_by('name')
+        
+        data = [{
+            'id': b.id,
+            'name': b.name,
+            'code': b.code,
+            'capacity': b.capacity,
+            'address': b.address or '',
+            'student_count': b.student_count
+        } for b in buildings]
+        
+        return Response({
+            'success': True,
+            'buildings': data,
+            'count': len(data)
+        })
+    except Exception as e:
+        return Response({
+            'error': str(e),
+            'message': 'Failed to load buildings'
+        }, status=500)
 class StudentClearanceFormsView(APIView):
     permission_classes = [IsAuthenticated, SystemOpenPermission]
 
@@ -691,7 +862,7 @@ class SystemControlViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, IsAdminUserRole]
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'status']:
+        if self.action in ['list', 'retrieve', 'status','check_module_access']:
             permission_classes = [IsAuthenticated]
         else:
             permission_classes = [IsAuthenticated, IsAdminUserRole]
@@ -733,7 +904,8 @@ def admin_create_user(request):
     password = data.get("password")
     email = data.get("email")
     role = data.get("role")
-    department_id = data.get("department")  # This should be department ID now
+    department_id = data.get("department") 
+    building_ids = data.get("assigned_buildings", []) 
 
     if not all([username, password, email, role]):
         return Response({"error": "Missing fields"}, status=400)
@@ -755,10 +927,36 @@ def admin_create_user(request):
         
         try:
             department_instance = Department.objects.get(id=department_id)
+             # Check if department already has a head
+            existing_head = User.objects.filter(
+                role='departmenthead',
+                department=department_instance
+            ).first()
+            
+            if existing_head:
+                return Response({
+                    "error": f"Department '{department_instance.name}' already has a head: {existing_head.username}"
+                }, status=400)
         except Department.DoesNotExist:
             return Response({"error": "Department not found"}, status=404)
     
-    # For other roles, department should be None or not provided
+    # For dormitory role, handle building assignments
+    elif role == "dormitory":
+        # Validate building IDs if provided
+        if building_ids:
+            try:
+                # Check if buildings exist and are active
+                buildings = Building.objects.filter(id__in=building_ids, is_active=True)
+                if buildings.count() != len(building_ids):
+                    found_ids = set(buildings.values_list('id', flat=True))
+                    missing_ids = set(building_ids) - found_ids
+                    return Response({
+                        "error": f"Some buildings not found or inactive: {list(missing_ids)}"
+                    }, status=400)
+            except Exception as e:
+                return Response({"error": f"Invalid building IDs: {str(e)}"}, status=400)
+    
+    # For other roles, department should be None
     elif department_id:
         return Response(
             {"error": f"{role} role should not have a department assigned"},
@@ -766,21 +964,36 @@ def admin_create_user(request):
         )
 
     try:
+        # Create user
         user = User.objects.create_user(
             username=username,
             password=password,
             email=email,
             role=role,
-            department=department_instance  # Pass Department instance, not ID
+            department=department_instance
         )
+
+        # Assign buildings for dormitory staff AFTER user is created
+        if role == "dormitory" and building_ids:
+            buildings = Building.objects.filter(id__in=building_ids, is_active=True)
+            user.assigned_buildings.set(buildings)
+            print(f"✅ Assigned {buildings.count()} buildings to {username}: {[b.name for b in buildings]}")
 
         Token.objects.get_or_create(user=user)
 
-        return Response(UserSerializer(user).data, status=201)
+        # Return user data with building info
+        user_data = UserSerializer(user).data
+        if role == "dormitory":
+            user_data['assigned_buildings'] = [
+                {"id": b.id, "name": b.name, "code": b.code} 
+                for b in user.assigned_buildings.all()
+            ]
+
+        return Response(user_data, status=201)
         
     except Exception as e:
+        print(f"❌ Error creating user: {str(e)}")
         return Response({"error": str(e)}, status=500)
-
 # ==================== ADMIN ACTIVITIES ====================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, IsAdminUserRole])
@@ -931,6 +1144,37 @@ class UserDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated, IsAdminUserRole]
+    
+    def update(self, request, *args, **kwargs):
+        try:
+            partial = kwargs.pop('partial', False)
+            instance = self.get_object()
+            serializer = self.get_serializer(instance, data=request.data, partial=partial)
+            
+            if serializer.is_valid():
+                self.perform_update(serializer)
+                return Response({
+                    "message": "User updated successfully",
+                    "user": serializer.data
+                })
+            else:
+                # Log validation errors
+                print(f"Validation errors: {serializer.errors}")
+                return Response({
+                    "error": "Validation failed",
+                    "details": serializer.errors
+                }, status=status.HTTP_400_BAD_REQUEST)
+                
+        except Exception as e:
+            print(f"Error updating user: {str(e)}")
+            return Response({
+                "error": "Failed to update user",
+                "details": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def patch(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
 # ==================== NOTIFICATIONS ====================
 @api_view(["GET"])
@@ -1132,9 +1376,7 @@ def check_meal_dues_api(request, student_id):
         return Response({"error": str(e)}, status=500)
 
 
-
 # ==================== LIBRARIAN VIEWS ====================
-# In views.py, update librarian_action, cafeteria_action, and dormitory_action:
 
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
@@ -1272,6 +1514,7 @@ University Clearance System
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def cafeteria_action(request, pk):
+    """Cafeteria action on clearance form - SENDS TO PSYCHOLOGY NEXT"""
     if request.user.role != "cafeteria":
         return Response(
             {"error": "Unauthorized - Cafeteria access only"},
@@ -1299,7 +1542,7 @@ def cafeteria_action(request, pk):
             f"{request.user.get_full_name()} (Cafeteria Manager)"
         )
         form.cafeteria_approved_at = timezone.now()
-        form.status = "approved_cafeteria"
+        form.status = "approved_cafeteria"  # Send to Psychology
 
         form.cafeteria_note = "Approved"
         if note:
@@ -1314,16 +1557,27 @@ def cafeteria_action(request, pk):
                 title="Form Approved by Cafeteria",
                 message=(
                     f"✅ Your clearance form #{form.id} has been APPROVED "
-                    f"by Cafeteria and sent to Dormitory. "
+                    f"by Cafeteria and sent to Psychology. "
                     f"Note: {form.cafeteria_note}"
                 ),
                 clearance_form=form
             )
+        
+        # Send notification to Psychology department
+        psychology_users = User.objects.filter(role='psychology', is_active=True)
+        for psych in psychology_users:
+            Notification.objects.create(
+                user=psych,
+                title="New Form for Psychology Review",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Psychology review",
+                clearance_form=form
+            )
 
         return Response({
-            "message": "Approved by Cafeteria",
+            "message": "Approved by Cafeteria - Sent to Psychology",
             "status": form.status,
-            "approved_by": form.cafeteria_approved_by
+            "approved_by": form.cafeteria_approved_by,
+            "next_department": "psychology"
         })
 
     # ================= REJECT =================
@@ -1348,7 +1602,7 @@ def cafeteria_action(request, pk):
             if payment_amount:
                 payment_link += f"&amount={payment_amount}"
             if payment_reason:
-                payment_link += f"&reason={payment_reason}"
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
 
             if form.student:
                 Notification.objects.create(
@@ -1404,15 +1658,14 @@ def cafeteria_action(request, pk):
         status=400
     )
 
-
-# ==================== DORMITORY VIEWS ====================
+# ==================== PSYCHOLOGY VIEWS ====================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def dormitory_forms(request):
-    if request.user.role != "dormitory":
-        return Response({"error": "Unauthorized - Dormitory access only"}, status=403)
+def psychology_forms(request):
+    """Get forms that are approved by cafeteria and pending psychology check"""
+    if request.user.role != "psychology":
+        return Response({"error": "Unauthorized - Psychology access only"}, status=403)
 
-    # Get forms that are approved by cafeteria and pending dormitory check
     forms = ClearanceForm.objects.filter(status="approved_cafeteria").order_by('-created_at')
 
     return Response([
@@ -1431,12 +1684,1533 @@ def dormitory_forms(request):
             "section": f.section,
             "reason": f.reason,
             "status": f.status,
-            "note": f.note if hasattr(f, 'note') else "",
-            "library_note": f.library_note if hasattr(f, 'library_note') else "",
             "cafeteria_note": f.cafeteria_note if hasattr(f, 'cafeteria_note') else "",
+            "psychology_note": f.psychology_note if hasattr(f, 'psychology_note') else "",
             "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
         } for f in forms
     ])
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def psychology_action(request, pk):
+    """Psychology action on clearance form - SENDS TO SPORT MASTER NEXT"""
+    if request.user.role != "psychology":
+        return Response({"error": "Unauthorized - Psychology access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    # Must be approved by Cafeteria first
+    if form.status != "approved_cafeteria":
+        return Response(
+            {"error": "Form must be approved by Cafeteria first"},
+            status=400
+        )
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        form.psychology_approved_by = (
+            f"{request.user.get_full_name()} (Psychology)"
+        )
+        form.psychology_approved_at = timezone.now()
+        form.status = "approved_psychology"  # Send to Sport Master
+
+        form.psychology_note = "Approved"
+        if note:
+            form.psychology_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Psychology",
+                message=f"✅ Your form #{form.id} has been APPROVED by Psychology and sent to Sport Master. Note: {form.psychology_note}",
+                clearance_form=form
+            )
+        
+        # Notify Sport Master
+        sport_users = User.objects.filter(role='sportmaster', is_active=True)
+        for sport in sport_users:
+            Notification.objects.create(
+                user=sport,
+                title="New Form for Sport Master",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Sport Master review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Psychology - Sent to Sport Master",
+            "status": form.status,
+            "approved_by": form.psychology_approved_by,
+            "next_department": "sportmaster"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_psychology_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.psychology_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=psychology"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Psychology Payment Required",
+                    message=f"❌ Form #{form.id} requires PSYCHOLOGY PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.psychology_note = f"Rejected by {request.user.get_full_name()} (Psychology): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Psychology",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Psychology.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.psychology_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+
+
+# ==================== SPORT MASTER VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def sportmaster_forms(request):
+    """Get forms that are approved by psychology and pending sport master check"""
+    if request.user.role != "sportmaster":
+        return Response({"error": "Unauthorized - Sport Master access only"}, status=403)
+
+    forms = ClearanceForm.objects.filter(status="approved_psychology").order_by('-created_at')
+
+    return Response([
+        {
+            "id": f.id,
+            "student_id": f.student.id if f.student else None,
+            "student_email": f.student.email if f.student else None,
+            "full_name": f.full_name,
+            "id_number": f.id_number,
+            "department_name": f.department_name,
+            "college": f.college,
+            "program_level": f.program_level,
+            "enrollment_type": f.enrollment_type,
+            "year": f.year,
+            "semester": f.semester,
+            "section": f.section,
+            "reason": f.reason,
+            "status": f.status,
+            "psychology_note": f.psychology_note if hasattr(f, 'psychology_note') else "",
+            "sportmaster_note": f.sportmaster_note if hasattr(f, 'sportmaster_note') else "",
+            "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        } for f in forms
+    ])
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def sportmaster_action(request, pk):
+    """Sport Master action on clearance form - SENDS TO CAMPUS POLICE NEXT"""
+    if request.user.role != "sportmaster":
+        return Response({"error": "Unauthorized - Sport Master access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    if form.status != "approved_psychology":
+        return Response({"error": "Form must be approved by Psychology first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        form.sportmaster_approved_by = f"{request.user.get_full_name()} (Sport Master)"
+        form.sportmaster_approved_at = timezone.now()
+        form.status = "approved_sportmaster"  # Send to Campus Police
+
+        form.sportmaster_note = "Approved"
+        if note:
+            form.sportmaster_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Sport Master",
+                message=f"✅ Your form #{form.id} has been APPROVED by Sport Master and sent to Campus Police. Note: {form.sportmaster_note}",
+                clearance_form=form
+            )
+        
+        # Notify Campus Police
+        police_users = User.objects.filter(role='campuspolice', is_active=True)
+        for police in police_users:
+            Notification.objects.create(
+                user=police,
+                title="New Form for Campus Police",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Campus Police review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Sport Master - Sent to Campus Police",
+            "status": form.status,
+            "approved_by": form.sportmaster_approved_by,
+            "next_department": "campuspolice"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_sportmaster_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.sportmaster_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=sportmaster"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Sport Master Payment Required",
+                    message=f"❌ Form #{form.id} requires SPORT MASTER PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.sportmaster_note = f"Rejected by {request.user.get_full_name()} (Sport Master): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Sport Master",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Sport Master.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.sportmaster_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+
+# ==================== CAMPUS POLICE VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def campuspolice_forms(request):
+    """Get forms that are approved by sport master and pending campus police check"""
+    if request.user.role != "campuspolice":
+        return Response({"error": "Unauthorized - Campus Police access only"}, status=403)
+
+    forms = ClearanceForm.objects.filter(status="approved_sportmaster").order_by('-created_at')
+
+    return Response([
+        {
+            "id": f.id,
+            "student_id": f.student.id if f.student else None,
+            "student_email": f.student.email if f.student else None,
+            "full_name": f.full_name,
+            "id_number": f.id_number,
+            "department_name": f.department_name,
+            "college": f.college,
+            "program_level": f.program_level,
+            "enrollment_type": f.enrollment_type,
+            "year": f.year,
+            "semester": f.semester,
+            "section": f.section,
+            "reason": f.reason,
+            "status": f.status,
+            "sportmaster_note": f.sportmaster_note if hasattr(f, 'sportmaster_note') else "",
+            "campuspolice_note": f.campuspolice_note if hasattr(f, 'campuspolice_note') else "",
+            "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        } for f in forms
+    ])
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def campuspolice_action(request, pk):
+    """Campus Police action on clearance form - SENDS TO COOPERATION SHARING NEXT"""
+    if request.user.role != "campuspolice":
+        return Response({"error": "Unauthorized - Campus Police access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    if form.status != "approved_sportmaster":
+        return Response({"error": "Form must be approved by Sport Master first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        form.campuspolice_approved_by = f"{request.user.get_full_name()} (Campus Police)"
+        form.campuspolice_approved_at = timezone.now()
+        form.status = "approved_campuspolice"  # Send to Cooperation Sharing
+
+        form.campuspolice_note = "Approved"
+        if note:
+            form.campuspolice_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Campus Police",
+                message=f"✅ Your form #{form.id} has been APPROVED by Campus Police and sent to Cooperation Sharing. Note: {form.campuspolice_note}",
+                clearance_form=form
+            )
+        
+        # Notify Cooperation Sharing
+        coop_users = User.objects.filter(role='cooperationsharing', is_active=True)
+        for coop in coop_users:
+            Notification.objects.create(
+                user=coop,
+                title="New Form for Cooperation Sharing",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Cooperation Sharing review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Campus Police - Sent to Cooperation Sharing",
+            "status": form.status,
+            "approved_by": form.campuspolice_approved_by,
+            "next_department": "cooperationsharing"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_campuspolice_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.campuspolice_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=campuspolice"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Campus Police Payment Required",
+                    message=f"❌ Form #{form.id} requires CAMPUS POLICE PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.campuspolice_note = f"Rejected by {request.user.get_full_name()} (Campus Police): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Campus Police",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Campus Police.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.campuspolice_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+# ==================== COOPERATION SHARING VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def cooperationsharing_forms(request):
+    """Get forms that are approved by campus police and pending cooperation sharing check"""
+    if request.user.role != "cooperationsharing":
+        return Response({"error": "Unauthorized - Cooperation Sharing access only"}, status=403)
+
+    # FIXED: Use correct status - approved_campuspolice should go to cooperation sharing
+    forms = ClearanceForm.objects.filter(status="approved_campuspolice").order_by('-created_at')
+
+    return Response([
+        {
+            "id": f.id,
+            "student_id": f.student.id if f.student else None,
+            "student_email": f.student.email if f.student else None,
+            "full_name": f.full_name,
+            "id_number": f.id_number,
+            "department_name": f.department_name,
+            "college": f.college,
+            "program_level": f.program_level,
+            "enrollment_type": f.enrollment_type,
+            "year": f.year,
+            "semester": f.semester,
+            "section": f.section,
+            "reason": f.reason,
+            "status": f.status,
+            "campuspolice_note": f.campuspolice_note if hasattr(f, 'campuspolice_note') else "",
+            "cooperationsharing_note": f.cooperationsharing_note if hasattr(f, 'cooperationsharing_note') else "",
+            "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        } for f in forms
+    ])
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def cooperationsharing_action(request, pk):
+    """Cooperation Sharing action on clearance form - SENDS TO DOP CORDINATOR NEXT"""
+    if request.user.role != "cooperationsharing":
+        return Response({"error": "Unauthorized - Cooperation Sharing access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    # Must be approved by Campus Police first
+    if form.status != "approved_campuspolice":
+        return Response(
+            {"error": "Form must be approved by Campus Police first"},
+            status=400
+        )
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    # ================= APPROVE =================
+    if action == "approve":
+        # FIXED: Use correct field names
+        form.cooperationsharing_approved_by = f"{request.user.get_full_name()} (Cooperation Sharing)"
+        form.cooperationsharing_approved_at = timezone.now()
+        form.status = "approved_cooperationsharing"  # Send to DOP Cordinator
+
+        form.cooperationsharing_note = "Approved"
+        if note:
+            form.cooperationsharing_note += f": {note}"
+
+        form.save()
+
+        # Notify student
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Cooperation Sharing",
+                message=f"✅ Your form #{form.id} has been APPROVED by Cooperation Sharing and sent to DOP Cordinator. Note: {form.cooperationsharing_note}",
+                clearance_form=form
+            )
+        
+        # Notify DOP Cordinator
+        dop_users = User.objects.filter(role='dopcordinator', is_active=True)
+        for dop in dop_users:
+            Notification.objects.create(
+                user=dop,
+                title="New Form for DOP Cordinator",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for DOP Cordinator review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Cooperation Sharing - Sent to DOP Cordinator",
+            "status": form.status,
+            "approved_by": form.cooperationsharing_approved_by,
+            "next_department": "dopcordinator"
+        })
+
+    # ================= REJECT =================
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_cooperationsharing_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.cooperationsharing_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=cooperationsharing"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Cooperation Sharing Payment Required",
+                    message=f"❌ Form #{form.id} requires COOPERATION SHARING PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.cooperationsharing_note = f"Rejected by {request.user.get_full_name()} (Cooperation Sharing): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Cooperation Sharing",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Cooperation Sharing.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.cooperationsharing_note
+            })
+
+    return Response({"error": "Invalid action. Use 'approve' or 'reject'"}, status=400)
+    """Cooperation Sharing action on clearance form - SENDS TO DOP CORDINATOR NEXT"""
+    if request.user.role != "cooperationsharing":
+        return Response({"error": "Unauthorized - Cooperation Sharing access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    if form.status != "approved_campuspolice":
+        return Response({"error": "Form must be approved by Campus Police first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        # FIXED: Use correct field name 'cooperationsharing_approved_by' instead of 'coastsharing_approved_by'
+        form.cooperationsharing_approved_by = f"{request.user.get_full_name()} (Cooperation Sharing)"
+        form.cooperationsharing_approved_at = timezone.now()
+        form.status = "approved_cooperationsharing"  # Send to DOP Cordinator
+
+        form.cooperationsharing_note = "Approved"
+        if note:
+            form.cooperationsharing_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Cooperation Sharing",
+                message=f"✅ Your form #{form.id} has been APPROVED by Cooperation Sharing and sent to DOP Cordinator. Note: {form.cooperationsharing_note}",
+                clearance_form=form
+            )
+        
+        # Notify DOP Cordinator
+        dop_users = User.objects.filter(role='dopcordinator', is_active=True)
+        for dop in dop_users:
+            Notification.objects.create(
+                user=dop,
+                title="New Form for DOP Cordinator",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for DOP Cordinator review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Cooperation Sharing",
+            "status": form.status,
+            "approved_by": form.cooperationsharing_approved_by,
+            "next_department": "dopcordinator"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_cooperationsharing_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.cooperationsharing_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=cooperationsharing"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Cooperation Sharing Payment Required",
+                    message=f"❌ Form #{form.id} requires COOPERATION SHARING PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.cooperationsharing_note = f"Rejected by {request.user.get_full_name()} (Cooperation Sharing): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Cooperation Sharing",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Cooperation Sharing.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.cooperationsharing_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+    """Cooperation Sharing action on clearance form - SENDS TO DOP CORDINATOR NEXT"""
+    if request.user.role != "cooperationsharing":
+        return Response({"error": "Unauthorized - Cooperation Sharing access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    if form.status != "approved_campuspolice":
+        return Response({"error": "Form must be approved by Campus Police first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        form.coastsharing_approved_by = f"{request.user.get_full_name()} (Coast Sharing)"
+        form.coastsharing_approved_at = timezone.now()
+        form.status = "approved_coastsharing"  # Send to DOP Cordinator
+
+        form.coastsharing_note = "Approved"
+        if note:
+            form.coastsharing_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Coast  Sharing",
+                message=f"✅ Your form #{form.id} has been APPROVED by Cooperation Sharing and sent to DOP Cordinator. Note: {form.cooperationsharing_note}",
+                clearance_form=form
+            )
+        
+        # Notify DOP Cordinator
+        dop_users = User.objects.filter(role='dopcordinator', is_active=True)
+        for dop in dop_users:
+            Notification.objects.create(
+                user=dop,
+                title="New Form for DOP Cordinator",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for DOP Cordinator review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Coast  Sharing",
+            "status": form.status,
+            "approved_by": form.coastsharing_approved_by,
+            "next_department": "dopcordinator"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_coastsharing_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.cooperationsharing_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=cooperationsharing"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Coast Sharing Payment Required",
+                    message=f"❌ Form #{form.id} requires COOPERATION SHARING PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.coastsharing_note  = f"Rejected by {request.user.get_full_name()} (Coast Sharing): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Coast Sharing",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Coast Sharing.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.coastsharing_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+
+# ==================== DOP CORDINATOR VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dopcordinator_forms(request):
+    """Get forms that are approved by cooperation sharing and pending DOP cordinator check"""
+    if request.user.role != "dopcordinator":
+        return Response({"error": "Unauthorized - DOP Cordinator access only"}, status=403)
+
+    # FIXED: Use correct status - approved_cooperationsharing
+    forms = ClearanceForm.objects.filter(status="approved_cooperationsharing").order_by('-created_at')
+
+    return Response([
+        {
+            "id": f.id,
+            "student_id": f.student.id if f.student else None,
+            "student_email": f.student.email if f.student else None,
+            "full_name": f.full_name,
+            "id_number": f.id_number,
+            "department_name": f.department_name,
+            "college": f.college,
+            "program_level": f.program_level,
+            "enrollment_type": f.enrollment_type,
+            "year": f.year,
+            "semester": f.semester,
+            "section": f.section,
+            "reason": f.reason,
+            "status": f.status,
+            "cooperationsharing_note": f.cooperationsharing_note if hasattr(f, 'cooperationsharing_note') else "",
+            "dopcordinator_note": f.dopcordinator_note if hasattr(f, 'dopcordinator_note') else "",
+            "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        } for f in forms
+    ])
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def dopcordinator_action(request, pk):
+    """DOP Cordinator action on clearance form - SENDS TO STUDENT AFFAIRS NEXT"""
+    if request.user.role != "dopcordinator":
+        return Response({"error": "Unauthorized - DOP Cordinator access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    # FIXED: Check for correct status 'approved_cooperationsharing'
+    if form.status != "approved_cooperationsharing":
+        return Response({"error": "Form must be approved by Cooperation Sharing first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        # FIXED: Use correct field name 'dopcoordinator_approved_by' (note the spelling: coordinator with 'o')
+        form.dopcoordinator_approved_by = f"{request.user.get_full_name()} (DOP Coordinator)"
+        form.dopcoordinator_approved_at = timezone.now()
+        form.status = "approved_dopcordinator"  # Send to Student Affairs
+
+        form.dopcordinator_note = "Approved"
+        if note:
+            form.dopcordinator_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by DOP Cordinator",
+                message=f"✅ Your form #{form.id} has been APPROVED by DOP Cordinator and sent to Student Affairs. Note: {form.dopcordinator_note}",
+                clearance_form=form
+            )
+        
+        # Notify Student Affairs
+        affairs_users = User.objects.filter(role='studentaffairs', is_active=True)
+        for affairs in affairs_users:
+            Notification.objects.create(
+                user=affairs,
+                title="New Form for Student Affairs",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Student Affairs review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by DOP Cordinator",
+            "status": form.status,
+            "approved_by": form.dopcoordinator_approved_by,
+            "next_department": "studentaffairs"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_dopcordinator_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.dopcordinator_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=dopcordinator"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="DOP Cordinator Payment Required",
+                    message=f"❌ Form #{form.id} requires DOP CORDINATOR PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.dopcordinator_note = f"Rejected by {request.user.get_full_name()} (DOP Cordinator): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by DOP Cordinator",
+                    message=f"❌ Your form #{form.id} has been REJECTED by DOP Cordinator.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.dopcordinator_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+# ==================== STUDENT AFFAIRS VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def studentaffairs_forms(request):
+    """Get forms that are approved by DOP cordinator and pending student affairs check"""
+    if request.user.role != "studentaffairs":
+        return Response({"error": "Unauthorized - Student Affairs access only"}, status=403)
+
+    forms = ClearanceForm.objects.filter(status="approved_dopcordinator").order_by('-created_at')
+
+    return Response([
+        {
+            "id": f.id,
+            "student_id": f.student.id if f.student else None,
+            "student_email": f.student.email if f.student else None,
+            "full_name": f.full_name,
+            "id_number": f.id_number,
+            "department_name": f.department_name,
+            "college": f.college,
+            "program_level": f.program_level,
+            "enrollment_type": f.enrollment_type,
+            "year": f.year,
+            "semester": f.semester,
+            "section": f.section,
+            "reason": f.reason,
+            "status": f.status,
+            "dopcordinator_note": f.dopcordinator_note if hasattr(f, 'dopcordinator_note') else "",
+            "studentaffairs_note": f.studentaffairs_note if hasattr(f, 'studentaffairs_note') else "",
+            "created_at": f.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        } for f in forms
+    ])
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def studentaffairs_action(request, pk):
+    """Student Affairs action on clearance form - SENDS TO DORMITORY NEXT"""
+    if request.user.role != "studentaffairs":
+        return Response({"error": "Unauthorized - Student Affairs access only"}, status=403)
+
+    form = get_object_or_404(ClearanceForm, pk=pk)
+
+    if form.status != "approved_dopcordinator":
+        return Response({"error": "Form must be approved by DOP Cordinator first"}, status=400)
+
+    action = request.data.get("action")
+    note = request.data.get("note", "")
+    requires_payment = request.data.get("requires_payment", False)
+    payment_amount = request.data.get("payment_amount")
+    payment_reason = request.data.get("payment_reason", "")
+
+    if action == "approve":
+        form.studentaffairs_approved_by = f"{request.user.get_full_name()} (Student Affairs)"
+        form.studentaffairs_approved_at = timezone.now()
+        form.status = "approved_studentaffairs"  # Send to Dormitory
+
+        form.studentaffairs_note = "Approved"
+        if note:
+            form.studentaffairs_note += f": {note}"
+
+        form.save()
+
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="Form Approved by Student Affairs",
+                message=f"✅ Your form #{form.id} has been APPROVED by Student Affairs and sent to Dormitory. Note: {form.studentaffairs_note}",
+                clearance_form=form
+            )
+        
+        # Notify Dormitory
+        dorm_users = User.objects.filter(role='dormitory', is_active=True)
+        for dorm in dorm_users:
+            Notification.objects.create(
+                user=dorm,
+                title="New Form for Dormitory",
+                message=f"📋 Form #{form.id} from {form.full_name} is ready for Dormitory review",
+                clearance_form=form
+            )
+
+        return Response({
+            "message": "Approved by Student Affairs - Sent to Dormitory",
+            "status": form.status,
+            "approved_by": form.studentaffairs_approved_by,
+            "next_department": "dormitory"
+        })
+
+    elif action == "reject":
+        if requires_payment:
+            form.status = "requires_studentaffairs_payment"
+            payment_note = f"Payment required: {payment_amount or 'TBD'} ETB. Reason: {payment_reason}"
+            if note:
+                payment_note = f"{note}. {payment_note}"
+            
+            form.studentaffairs_note = payment_note
+            form.save()
+
+            payment_link = f"/student/payments?form_id={form.id}&department=studentaffairs"
+            if payment_amount:
+                payment_link += f"&amount={payment_amount}"
+            if payment_reason:
+                payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Student Affairs Payment Required",
+                    message=f"❌ Form #{form.id} requires STUDENT AFFAIRS PAYMENT.\nAmount: {payment_amount or 'TBD'} ETB\nReason: {payment_reason}\nPay here: {payment_link}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Payment required",
+                "status": form.status,
+                "payment_link": payment_link
+            })
+        else:
+            form.status = "rejected"
+            form.studentaffairs_note = f"Rejected by {request.user.get_full_name()} (Student Affairs): {note}"
+            form.save()
+
+            if form.student:
+                Notification.objects.create(
+                    user=form.student,
+                    title="Form Rejected by Student Affairs",
+                    message=f"❌ Your form #{form.id} has been REJECTED by Student Affairs.\nReason: {note}",
+                    clearance_form=form
+                )
+
+            return Response({
+                "message": "Form rejected",
+                "status": form.status,
+                "note": form.studentaffairs_note
+            })
+
+    return Response({"error": "Invalid action"}, status=400)
+
+# Building CRUD endpoints
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def building_list(request):
+    """Admin: List all buildings or create new one"""
+    if request.method == 'GET':
+        buildings = Building.objects.annotate(
+            student_count=Count('building_students', distinct=True),
+            staff_count=Count('assigned_staff', distinct=True),
+            form_count=Count('form_buildings', distinct=True)
+        ).order_by('name')
+        
+        data = []
+        for building in buildings:
+            data.append({
+                'id': building.id,
+                'name': building.name,
+                'code': building.code,
+                'address': building.address,
+                'capacity': building.capacity,
+                'is_active': building.is_active,
+                'student_count': building.student_count,
+                'staff_count': building.staff_count,
+                'form_count': building.form_count,
+                'created_at': building.created_at,
+            })
+        return Response(data)
+    
+    elif request.method == 'POST':
+        serializer = BuildingSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "message": "Building created successfully",
+                "data": serializer.data
+            }, status=201)
+        return Response(serializer.errors, status=400)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def get_staff_with_buildings(request):
+    """Get all dormitory staff with their assigned buildings"""
+    try:
+        staff_members = User.objects.filter(role='dormitory', is_active=True).prefetch_related('assigned_buildings')
+        
+        data = []
+        for staff in staff_members:
+            buildings = staff.assigned_buildings.all()
+            data.append({
+                'id': staff.id,
+                'username': staff.username,
+                'email': staff.email,
+                'first_name': staff.first_name,
+                'last_name': staff.last_name,
+                'full_name': staff.get_full_name(),
+                'is_active': not staff.is_blocked,
+                'assigned_buildings': [
+                    {
+                        'id': b.id,
+                        'name': b.name,
+                        'code': b.code,
+                        'capacity': b.capacity
+                    } for b in buildings
+                ],
+                'building_count': buildings.count()
+            })
+        
+        return Response(data)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def get_unassigned_dormitory_staff(request):
+    """Get dormitory staff with no buildings assigned"""
+    try:
+        # Get staff with no assigned buildings
+        staff_members = User.objects.filter(
+            role='dormitory', 
+            is_active=True
+        ).annotate(
+            building_count=Count('assigned_buildings')
+        ).filter(building_count=0)
+        
+        data = []
+        for staff in staff_members:
+            data.append({
+                'id': staff.id,
+                'username': staff.username,
+                'email': staff.email,
+                'first_name': staff.first_name,
+                'last_name': staff.last_name,
+                'full_name': staff.get_full_name()
+            })
+        
+        return Response(data)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def get_building_staff(request, building_id):
+    """Get all staff assigned to a specific building"""
+    try:
+        building = Building.objects.get(id=building_id)
+        staff_members = building.assigned_staff.filter(role='dormitory', is_active=True)
+        
+        data = []
+        for staff in staff_members:
+            data.append({
+                'id': staff.id,
+                'username': staff.username,
+                'email': staff.email,
+                'first_name': staff.first_name,
+                'last_name': staff.last_name,
+                'full_name': staff.get_full_name()
+            })
+        
+        return Response({
+            'building': {
+                'id': building.id,
+                'name': building.name,
+                'code': building.code
+            },
+            'staff_count': len(data),
+            'staff': data
+        })
+    except Building.DoesNotExist:
+        return Response({"error": "Building not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def assign_dormitory_staff_buildings(request, staff_id):
+    """Admin: Assign buildings to dormitory staff"""
+    try:
+        # Validate staff exists and is dormitory
+        staff = User.objects.get(id=staff_id, role='dormitory')
+    except User.DoesNotExist:
+        return Response(
+            {"error": f"Dormitory staff with ID {staff_id} not found"}, 
+            status=404
+        )
+    
+    # Get building IDs from request
+    building_ids = request.data.get('building_ids', [])
+    
+    # Validate building_ids is a list
+    if not isinstance(building_ids, list):
+        return Response(
+            {"error": "building_ids must be a list"}, 
+            status=400
+        )
+    
+    try:
+        # If empty list, clear all assignments
+        if not building_ids:
+            staff.assigned_buildings.clear()
+            return Response({
+                "message": f"All buildings unassigned from {staff.username}",
+                "staff_id": staff.id,
+                "staff_name": staff.get_full_name() or staff.username,
+                "assigned_buildings": []
+            })
+        
+        # Validate buildings exist and are active
+        buildings = Building.objects.filter(id__in=building_ids, is_active=True)
+        
+        # Check if all buildings were found
+        if buildings.count() != len(building_ids):
+            found_ids = set(buildings.values_list('id', flat=True))
+            missing_ids = set(building_ids) - found_ids
+            
+            # Get details of missing buildings
+            missing_buildings = Building.objects.filter(
+                id__in=missing_ids
+            ).values('id', 'name', 'is_active')
+            
+            missing_details = []
+            for building in missing_buildings:
+                status = "inactive" if not building['is_active'] else "not found"
+                missing_details.append({
+                    "id": building['id'],
+                    "name": building['name'],
+                    "status": status
+                })
+            
+            return Response({
+                "error": f"Some buildings not found or inactive",
+                "missing_buildings": missing_details,
+                "found_buildings": [
+                    {"id": b.id, "name": b.name, "code": b.code}
+                    for b in buildings
+                ]
+            }, status=400)
+        
+        # Assign buildings (this clears previous assignments and sets new ones)
+        staff.assigned_buildings.set(buildings)
+        
+        # Get the assigned buildings with their details
+        assigned_buildings_data = []
+        for building in buildings:
+            assigned_buildings_data.append({
+                "id": building.id,
+                "name": building.name,
+                "code": building.code,
+                "capacity": building.capacity,
+                "student_count": building.building_students.filter(
+                    is_active=True
+                ).count()
+            })
+        
+        return Response({
+            "message": f"Assigned {buildings.count()} buildings to {staff.username}",
+            "staff_id": staff.id,
+            "staff_name": staff.get_full_name() or staff.username,
+            "assigned_buildings": assigned_buildings_data
+        })
+        
+    except Exception as e:
+        return Response(
+            {"error": f"Failed to assign buildings: {str(e)}"}, 
+            status=500
+        )
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def bulk_assign_buildings(request):
+    """Bulk assign buildings to multiple staff members"""
+    try:
+        assignments = request.data.get('assignments', [])
+        
+        if not assignments:
+            return Response({"error": "No assignments provided"}, status=400)
+        
+        results = []
+        for assignment in assignments:
+            staff_id = assignment.get('staff_id')
+            building_ids = assignment.get('building_ids', [])
+            
+            try:
+                staff = User.objects.get(id=staff_id, role='dormitory')
+                buildings = Building.objects.filter(id__in=building_ids, is_active=True)
+                staff.assigned_buildings.set(buildings)
+                
+                results.append({
+                    'staff_id': staff_id,
+                    'staff_name': staff.get_full_name() or staff.username,
+                    'status': 'success',
+                    'assigned_count': buildings.count()
+                })
+            except User.DoesNotExist:
+                results.append({
+                    'staff_id': staff_id,
+                    'status': 'failed',
+                    'error': 'Staff not found'
+                })
+            except Exception as e:
+                results.append({
+                    'staff_id': staff_id,
+                    'status': 'failed',
+                    'error': str(e)
+                })
+        
+        return Response({
+            'message': f'Processed {len(results)} assignments',
+            'results': results
+        })
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+@api_view(['GET', 'PUT', 'PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def building_detail(request, building_id):
+    """Admin: Get, update or delete building"""
+    try:
+        building = Building.objects.annotate(
+            student_count=Count('building_students', distinct=True),
+            staff_count=Count('assigned_staff', distinct=True),
+            form_count=Count('form_buildings', distinct=True)
+        ).get(id=building_id)
+    except Building.DoesNotExist:
+        return Response({"error": "Building not found"}, status=404)
+    
+    if request.method == 'GET':
+        data = {
+            'id': building.id,
+            'name': building.name,
+            'code': building.code,
+            'address': building.address,
+            'capacity': building.capacity,
+            'is_active': building.is_active,
+            'student_count': building.student_count,
+            'staff_count': building.staff_count,
+            'form_count': building.form_count,
+            'created_at': building.created_at,
+        }
+        return Response(data)
+    
+    elif request.method in ['PUT', 'PATCH']:
+        serializer = BuildingSerializer(building, data=request.data, partial=(request.method == 'PATCH'))
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "message": "Building updated successfully",
+                "data": serializer.data
+            })
+        return Response(serializer.errors, status=400)
+    
+    elif request.method == 'DELETE':
+        # Check if building has students
+        if building.building_students.filter(is_active=True).exists():
+            return Response({
+                "error": "Cannot delete building with assigned students"
+            }, status=400)
+        building.delete()
+        return Response({"message": "Building deleted successfully"}, status=204)
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def assign_dormitory_staff_buildings(request, staff_id):
+    """Admin: Assign buildings to dormitory staff"""
+    try:
+        staff = User.objects.get(id=staff_id, role='dormitory')
+    except User.DoesNotExist:
+        return Response({"error": "Dormitory staff not found"}, status=404)
+    
+    building_ids = request.data.get('building_ids', [])
+    
+    if not building_ids:
+        return Response({"error": "No buildings provided"}, status=400)
+    
+    buildings = Building.objects.filter(id__in=building_ids, is_active=True)
+    
+    if buildings.count() != len(building_ids):
+        return Response({"error": "Some buildings not found or inactive"}, status=400)
+    
+    staff.assigned_buildings.set(buildings)
+    
+    return Response({
+        "message": f"Assigned {buildings.count()} buildings to {staff.username}",
+        "assigned_buildings": [
+            {"id": b.id, "name": b.name, "code": b.code} 
+            for b in buildings
+        ]
+    })
+
+# In your views.py - Add this view to get staff by building
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def get_staff_by_building(request, building_id):
+    """Get all dormitory staff assigned to a specific building"""
+    try:
+        building = Building.objects.get(id=building_id)
+        staff_members = building.assigned_staff.filter(role='dormitory', is_active=True)
+        
+        data = []
+        for staff in staff_members:
+            data.append({
+                'id': staff.id,
+                'username': staff.username,
+                'email': staff.email,
+                'full_name': staff.get_full_name(),
+                'first_name': staff.first_name,
+                'last_name': staff.last_name,
+                'is_blocked': staff.is_blocked
+            })
+        
+        return Response({
+            'building': {
+                'id': building.id,
+                'name': building.name,
+                'code': building.code
+            },
+            'staff_count': len(data),
+            'staff': data
+        })
+        
+    except Building.DoesNotExist:
+        return Response({"error": "Building not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def export_building_stats(request):
+    """Admin: Export building statistics to CSV"""
+    buildings = Building.objects.annotate(
+        student_count=Count('building_students', distinct=True),
+        staff_count=Count('assigned_staff', distinct=True),
+        form_count=Count('form_buildings', distinct=True)
+    ).order_by('name')
+    
+    response = HttpResponse(content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename="building_stats_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv"'
+    
+    writer = csv.writer(response)
+    writer.writerow([
+        'Building Name', 'Building Code', 'Capacity', 'Current Students',
+        'Assigned Staff', 'Pending Forms', 'Active Status', 'Address', 'Created Date'
+    ])
+    
+    for building in buildings:
+        writer.writerow([
+            building.name,
+            building.code,
+            building.capacity or 'Unlimited',
+            building.student_count,
+            building.staff_count,
+            building.form_buildings.filter(status='approved_studentaffairs').count(),
+            'Active' if building.is_active else 'Inactive',
+            building.address or 'N/A',
+            building.created_at.strftime('%Y-%m-%d') if building.created_at else 'N/A'
+        ])
+    
+    return response
+# ==================== DORMITORY VIEWS ====================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dormitory_forms(request):
+    """
+    Get clearance forms ONLY for students in the dormitory staff's assigned buildings
+    Each dormitory manager sees ONLY their own building's students
+    Forms must be approved by Student Affairs first
+    """
+    if request.user.role != "dormitory":
+        return Response({"error": "Unauthorized - Dormitory access only"}, status=403)
+    
+    # Get buildings assigned to THIS SPECIFIC dormitory manager
+    assigned_buildings = request.user.assigned_buildings.all()
+    
+    print(f"\n=== DORMITORY DASHBOARD ACCESS ===")
+    print(f"Manager: {request.user.username} (ID: {request.user.id})")
+    print(f"Name: {request.user.get_full_name()}")
+    print(f"Assigned buildings: {[b.name for b in assigned_buildings]}")
+    
+    if not assigned_buildings.exists():
+        print(f"WARNING: {request.user.username} has no buildings assigned")
+        return Response({
+            "staff_name": request.user.get_full_name() or request.user.username,
+            "staff_id": request.user.id,
+            "assigned_buildings": [],
+            "forms": [],
+            "total_forms": 0,
+            "message": "No buildings assigned to you. Please contact admin."
+        }, status=200)
+    
+    # CRITICAL: Get forms ONLY from students whose building is in THIS manager's assigned buildings
+    # AND that are approved by Student Affairs
+    forms = ClearanceForm.objects.filter(
+        status="approved_studentaffairs",  # Must come from Student Affairs
+        student_building__in=assigned_buildings  # This ensures ONLY this manager's students
+    ).select_related('student', 'student_building').order_by('-created_at')
+    
+    print(f"Found {forms.count()} forms for {request.user.username}'s buildings from Student Affairs")
+    
+    # Format response - SIMPLE like department head
+    response_data = []
+    for form in forms:
+        response_data.append({
+            "id": form.id,
+            "student_id": form.student.id if form.student else None,
+            "student_email": form.student.email if form.student else None,
+            "full_name": form.full_name,
+            "id_number": form.id_number,
+            "department_name": form.department_name,
+            "college": form.college,
+            "program_level": form.program_level,
+            "enrollment_type": form.enrollment_type,
+            "year": form.year,
+            "semester": form.semester,
+            "section": form.section,
+            "reason": form.reason,
+            "status": form.status,
+            "building": {
+                "id": form.student_building.id if form.student_building else None,
+                "name": form.student_building.name if form.student_building else None,
+                "code": form.student_building.code if form.student_building else None
+            },
+            "library_note": form.library_note or "",
+            "cafeteria_note": form.cafeteria_note or "",
+            "psychology_note": form.psychology_note or "",
+            "sportmaster_note": form.sportmaster_note or "",
+            "campuspolice_note": form.campuspolice_note or "",
+            "cooperationsharing_note": form.cooperationsharing_note or "",
+           # FIXED: Changed from dopcordinator_note to dopcoordinator_note
+            "dopcoordinator_note": form.dopcoordinator_note or "",
+            "studentaffairs_note": form.studentaffairs_note or "",
+            "dormitory_note": form.dormitory_note or "",
+            "created_at": form.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        })
+    
+    # Add assigned buildings info
+    buildings_data = []
+    for building in assigned_buildings:
+        buildings_data.append({
+            "id": building.id,
+            "name": building.name,
+            "code": building.code,
+            "student_count": User.objects.filter(role='student', building=building, is_active=True).count()
+        })
+    
+    print(f"✓ Returning {len(response_data)} forms to {request.user.username}")
+    print(f"  Buildings: {[b['name'] for b in buildings_data]}")
+    
+    return Response({
+        "staff_name": request.user.get_full_name() or request.user.username,
+        "staff_id": request.user.id,
+        "assigned_buildings": buildings_data,
+        "forms": response_data,
+        "total_forms": len(response_data)
+    })
+
 
 
 @api_view(["GET"])
@@ -1490,11 +3264,45 @@ def check_dorm_dues_api(request, student_id):
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def dormitory_action(request, pk):
+    """
+    Dormitory action - ONLY for students in the manager's assigned buildings
+    After approval, sends to Registrar
+    Like Department Head - can only act on their own students
+    """
     if request.user.role != "dormitory":
-        return Response({"error": "Unauthorized"}, status=403)
+        return Response({"error": "Unauthorized - Dormitory access only"}, status=403)
 
     form = get_object_or_404(ClearanceForm, pk=pk)
-
+    
+    print(f"\n=== DORMITORY ACTION ===")
+    print(f"Manager: {request.user.username}")
+    print(f"Form ID: {pk}")
+    print(f"Student: {form.full_name}")
+    print(f"Student Building: {form.student_building.name if form.student_building else 'None'}")
+    
+    # CRITICAL: Verify this student belongs to this manager's buildings
+    assigned_buildings = request.user.assigned_buildings.all()
+    
+    if not form.student_building:
+        return Response({
+            "error": "Student has no building assigned",
+            "message": "Cannot process this form"
+        }, status=400)
+    
+    if form.student_building not in assigned_buildings:
+        print(f"ERROR: {request.user.username} tried to access student from {form.student_building.name}")
+        return Response({
+            "error": f"You are not authorized to manage students from {form.student_building.name}",
+            "message": f"You only manage: {[b.name for b in assigned_buildings]}",
+            "your_buildings": [b.name for b in assigned_buildings]
+        }, status=403)
+    
+    # Must be approved by Student Affairs first
+    if form.status != "approved_studentaffairs":
+        return Response({
+            "error": f"Form must be approved by Student Affairs first. Current status: {form.status}"
+        }, status=400)
+        
     action = request.data.get("action")
     note = request.data.get("note", "")
     requires_payment = request.data.get("requires_payment", False)
@@ -1503,108 +3311,212 @@ def dormitory_action(request, pk):
 
     # ===== APPROVE =====
     if action == "approve":
-        form.status = "approved_dormitory"
-
-        form.dormitory_approved_by = (
-            f"{request.user.get_full_name()} (Dormitory Manager)"
-        )
+        form.dormitory_approved_by = f"{request.user.get_full_name()} (Dormitory Manager - {form.student_building.name})"
         form.dormitory_approved_at = timezone.now()
-
-        form.dormitory_note = "Approved"
-        if note:
-            form.dormitory_note += f": {note}"
+        form.status = "approved_dormitory"  # Send to Registrar
+        form.dormitory_note = note or f"Approved for {form.student_building.name} - Room clearance verified"
 
         form.save()
+        
+        print(f"✓ Form {pk} approved by {request.user.username}")
+        print(f"  New status: {form.status} (sent to Registrar)")
+
+        # Notify student
+        if form.student:
+            Notification.objects.create(
+                user=form.student,
+                title="✅ Form Approved by Dormitory",
+                message=(
+                    f"Your clearance form has been APPROVED by Dormitory Manager for {form.student_building.name}\n"
+                    f"and sent to Registrar for final clearance.\n"
+                    f"Note: {form.dormitory_note}"
+                ),
+                clearance_form=form,
+                notification_type="success"
+            )
+            print(f"✓ Notification sent to student {form.student.username}")
+        
+        # Notify ALL Registrar staff
+        registrar_users = User.objects.filter(role='registrar', is_active=True)
+        notification_count = 0
+        for registrar in registrar_users:
+            Notification.objects.create(
+                user=registrar,
+                title="📋 New Form Ready for Registrar",
+                message=(
+                    f"Form #{form.id} from {form.full_name} ({form.student_building.name}) "
+                    f"has been approved by Dormitory and is ready for final clearance.\n"
+                    f"Student ID: {form.id_number}\n"
+                    f"Department: {form.department_name}"
+                ),
+                clearance_form=form,
+                notification_type="info"
+            )
+            notification_count += 1
+        print(f"✓ Notified {notification_count} registrar(s) about form #{form.id}")
+        
+        return Response({
+            "message": f"Form approved for {form.student_building.name} and sent to Registrar",
+            "status": form.status,
+            "approved_by": form.dormitory_approved_by,
+            "approved_at": form.dormitory_approved_at,
+            "next_department": "registrar",
+            "building": {
+                "id": form.student_building.id,
+                "name": form.student_building.name,
+                "code": form.student_building.code
+            }
+        })
+
+    # ===== REJECT WITH PAYMENT =====
+    elif action == "reject" and requires_payment:
+        form.status = "requires_dormitory_payment"
+        payment_note = f"Payment required for {form.student_building.name}: {payment_amount} ETB. Reason: {payment_reason}"
+        if note:
+            payment_note = f"{note}. {payment_note}"
+        
+        form.dormitory_note = payment_note
+        form.save()
+        
+        print(f"⚠ Form {pk} requires payment. New status: {form.status}")
+
+        payment_link = f"/student/payments?form_id={form.id}&department=dormitory"
+        if payment_amount:
+            payment_link += f"&amount={payment_amount}"
+        if payment_reason:
+            payment_link += f"&reason={payment_reason.replace(' ', '%20')}"
 
         if form.student:
             Notification.objects.create(
                 user=form.student,
-                title="Form Approved by Dormitory",
+                title="💰 Dormitory Payment Required",
                 message=(
-                    f"✅ Your clearance form #{form.id} has been APPROVED by Dormitory "
-                    f"and forwarded to Registrar. Note: {form.dormitory_note}"
+                    f"Your clearance form requires payment for {form.student_building.name}\n"
+                    f"Amount: {payment_amount} ETB\n"
+                    f"Reason: {payment_reason}\n"
+                    f"Pay here: {payment_link}"
                 ),
-                clearance_form=form
+                clearance_form=form,
+                notification_type="warning"
             )
 
         return Response({
-            "message": "Form approved successfully",
+            "message": "Payment required",
             "status": form.status,
-            "approved_by": form.dormitory_approved_by
+            "payment_link": payment_link,
+            "amount": payment_amount,
+            "reason": payment_reason,
+            "building": {
+                "id": form.student_building.id,
+                "name": form.student_building.name
+            }
         })
 
-    # ===== REJECT / PAYMENT =====
+    # ===== HARD REJECT =====
     elif action == "reject":
-        if requires_payment:
-            form.status = "requires_dormitory_payment"
-
-            payment_note = (
-                f"Payment required: "
-                f"{payment_amount if payment_amount else 'To be determined'} ETB. "
-                f"Reason: {payment_reason}"
-            )
-            if note:
-                payment_note = f"{note}. {payment_note}"
-
-            form.dormitory_note = payment_note
-            form.save()
-
-            payment_link = f"/student/payments?form_id={form.id}&department=dormitory"
-            if payment_amount:
-                payment_link += f"&amount={payment_amount}"
-            if payment_reason:
-                payment_link += f"&reason={payment_reason}"
-
-            if form.student:
-                Notification.objects.create(
-                    user=form.student,
-                    title="Dormitory Payment Required",
-                    message=(
-                        f"❌ Your clearance form #{form.id} requires DORMITORY PAYMENT.\n"
-                        f"Reason: {payment_reason}\n"
-                        f"Amount: {payment_amount if payment_amount else 'TBD'} ETB\n"
-                        f"Pay here: {payment_link}"
-                    ),
-                    clearance_form=form
-                )
-
-            return Response({
-                "message": "Payment required",
-                "status": form.status,
-                "payment_link": payment_link,
-                "amount": payment_amount,
-                "reason": payment_reason
-            })
-
-        # ===== HARD REJECT =====
         form.status = "rejected"
-        form.dormitory_note = "Rejected"
-        if note:
-            form.dormitory_note += f": {note}"
-
+        form.dormitory_note = f"Rejected by {request.user.get_full_name()} ({form.student_building.name}): {note}"
         form.save()
+        
+        print(f"✗ Form {pk} rejected")
 
         if form.student:
             Notification.objects.create(
                 user=form.student,
-                title="Form Rejected by Dormitory",
+                title="❌ Form Rejected by Dormitory",
                 message=(
-                    f"❌ Your clearance form #{form.id} has been REJECTED by Dormitory. "
+                    f"Your clearance form has been REJECTED by Dormitory Manager for {form.student_building.name}\n"
                     f"Reason: {note}"
                 ),
-                clearance_form=form
+                clearance_form=form,
+                notification_type="error"
             )
 
         return Response({
             "message": "Form rejected",
+            "status": form.status,
             "note": form.dormitory_note
         })
 
-    # ===== INVALID ACTION =====
     return Response(
         {"error": "Invalid action. Use 'approve' or 'reject'"},
         status=400
     )
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def debug_dormitory_dashboard(request):
+    """Debug endpoint - shows exactly what each dormitory manager sees"""
+    if request.user.role != 'dormitory' and request.user.role != 'admin':
+        return Response({"error": "Unauthorized"}, status=403)
+    
+    staff = request.user
+    assigned_buildings = staff.assigned_buildings.all()
+    
+    debug_info = {
+        "manager": {
+            "id": staff.id,
+            "username": staff.username,
+            "full_name": staff.get_full_name(),
+            "email": staff.email
+        },
+        "assigned_buildings": [],
+        "students_you_manage": [],
+        "forms_from_student_affairs": []  # Forms waiting for dormitory approval
+    }
+    
+    # For each assigned building
+    for building in assigned_buildings:
+        # Students in this building
+        students = User.objects.filter(
+            role='student',
+            building=building,
+            is_active=True
+        ).select_related('building')
+        
+        student_list = []
+        for student in students:
+            student_list.append({
+                "id": student.id,
+                "name": student.get_full_name(),
+                "username": student.username,
+                "id_number": student.id_number,
+                "email": student.email
+            })
+        
+        # Forms from this building that are approved by Student Affairs
+        forms = ClearanceForm.objects.filter(
+            student_building=building,
+            status="approved_studentaffairs"  # Only forms from Student Affairs
+        ).select_related('student')
+        
+        form_list = []
+        for form in forms:
+            form_list.append({
+                "id": form.id,
+                "student": form.full_name,
+                "id_number": form.id_number,
+                "status": form.status,
+                "created_at": form.created_at.strftime('%Y-%m-%d %H:%M:%S')
+            })
+        
+        debug_info["assigned_buildings"].append({
+            "id": building.id,
+            "name": building.name,
+            "code": building.code,
+            "total_students": len(student_list),
+            "pending_forms_from_student_affairs": len(form_list),
+            "sample_students": student_list[:3]  # First 3 as sample
+        })
+        
+        debug_info["students_you_manage"].extend(student_list)
+        debug_info["forms_from_student_affairs"].extend(form_list)
+    
+    # If no buildings assigned
+    if not assigned_buildings.exists():
+        debug_info["message"] = "⚠️ No buildings assigned! Contact admin."
+    
+    return Response(debug_info)
 
 # ==================== GET ALL FORMS (Public endpoint for registrar) ====================
 @api_view(["GET"])
@@ -2015,7 +3927,15 @@ def generate_clearance_certificate(request, pk):
 
     return Response(certificate_data)
 
-
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def api_view_endpoint(request):
+    """Simple test endpoint for the React app"""
+    return Response({
+        "message": "API is working!",
+        "status": "success",
+        "timestamp": timezone.now().isoformat()
+    })
 
 # ==================== CLEARANCE FORM REQUESTS (Admin) ====================
 class ClearanceFormRequestsListView(APIView):
@@ -2465,7 +4385,7 @@ def download_clearance_certificate(request, form_id):
 
         # ================= HEADER =================
         p.setFont("Helvetica-Bold", 26)
-        p.drawCentredString(width / 2, height - 90, "UNIVERSITY CLEARANCE CERTIFICATE")
+        p.drawCentredString(width / 2, height - 90, "MAU CLEARANCE CERTIFICATE")
 
         p.setFont("Helvetica", 12)
         p.drawCentredString(
@@ -2496,7 +4416,7 @@ def download_clearance_certificate(request, form_id):
             y -= 22
 
         # ================= APPROVALS =================
-        y = y - 80
+        y = y - 30
         p.setFont("Helvetica-Bold", 13)
         p.drawString(100, y, "Clearance Approvals")
         p.line(100, y - 3, width - 100, y - 3)
@@ -2508,17 +4428,28 @@ def download_clearance_certificate(request, form_id):
             ("Department Head", form.department_approved_by),
             ("Library", form.library_approved_by),
             ("Cafeteria", form.cafeteria_approved_by),
+            ("Psychology", form.psychology_approved_by),
+            ("Sport Master", form.sportmaster_approved_by),
+            ("Campus Police", form.campuspolice_approved_by),
+            ("Cooperation Sharing", form.cooperationsharing_approved_by),
+            ("DOP Coordinator", form.dopcoordinator_approved_by),
+            ("Student Affairs", form.studentaffairs_approved_by),
             ("Dormitory", form.dormitory_approved_by),
             ("Registrar", form.registrar_approved_by),
         ]
 
         for role, name in approvals:
-            p.drawString(120, y, f"{role}:")
-            p.drawString(280, y, name or "—")
-            y -= 18
-            
+            if name:  # Only display if approved
+                p.drawString(120, y, f"{role}:")
+                # Handle long names by truncating if necessary
+                display_name = name
+                if len(display_name) > 40:
+                    display_name = display_name[:37] + "..."
+                p.drawString(280, y, display_name or "—")
+                y -= 18
             
             # ================= CLEARANCE STATEMENT =================
+        y = y - 20  # Add some spacing
         p.setFont("Helvetica", 12)
         p.drawCentredString(
             width / 2,
@@ -2527,12 +4458,12 @@ def download_clearance_certificate(request, form_id):
         )
         p.drawCentredString(
             width / 2,
-            y - 30,
+            y - 25,
             "is hereby fully cleared from the University."
         )
 
         # ================= QR CODE =================
-        certificate_id = f"CLEAR-{form.id_number}-{form.cleared_at.strftime('%Y%m%d')}"
+        certificate_id = f"CLEAR-{form.id_number}-{form.cleared_at.strftime('%Y%m%d') if form.cleared_at else timezone.now().strftime('%Y%m%d')}"
 
         qr_data = (
             f"Certificate ID: {certificate_id}\n"
@@ -2550,7 +4481,7 @@ def download_clearance_certificate(request, form_id):
 
         qr_image = ImageReader(qr_buffer)
 
-        qr_size = 110
+        qr_size = 90
         p.drawImage(
             qr_image,
             width - qr_size - 90,
@@ -2590,9 +4521,6 @@ def download_clearance_certificate(request, form_id):
         return Response({"error": "Form not found"}, status=404)
     except Exception as e:
         return Response({"error": str(e)}, status=500)
-
-
-
 
 
 # ==================== FORM STATUS TRACKING ====================
@@ -3424,7 +5352,7 @@ def update_profile_settings(request):
 # ==================== CHAT VIEWSETS ====================
 
 class ChatRoomViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing chat rooms"""
+    """ViewSet for managing chat rooms - FIXED VERSION"""
     serializer_class = ChatRoomSerializer
     permission_classes = [IsAuthenticated]
 
@@ -3434,25 +5362,28 @@ class ChatRoomViewSet(viewsets.ModelViewSet):
             return ChatRoom.objects.filter(
                 Q(student=user) | Q(participants=user),
                 is_active=True
-            ).distinct()
+            ).distinct().order_by('-last_message_time')
         elif user.role == 'departmenthead':
             return ChatRoom.objects.filter(
                 Q(specific_staff=user) | Q(participants=user),
                 is_active=True
-            ).distinct()
+            ).distinct().order_by('-last_message_time')
         else:
             # For other staff roles
             return ChatRoom.objects.filter(
                 Q(specific_staff=user) | Q(participants=user),
                 is_active=True
-            ).distinct()
+            ).distinct().order_by('-last_message_time')
 
     @action(detail=False, methods=['get'])
     def my_rooms(self, request):
         """Get chat rooms for current user"""
         rooms = self.get_queryset()
         serializer = self.get_serializer(rooms, many=True)
-        return Response(serializer.data)
+        return Response({
+            'status': 'success',
+            'data': serializer.data
+        })
 
     @action(detail=True, methods=['post'])
     def mark_as_read(self, request, pk=None):
@@ -3461,14 +5392,17 @@ class ChatRoomViewSet(viewsets.ModelViewSet):
         user = request.user
         
         # Mark all unread messages as read (excluding user's own messages)
-        room.messages.filter(
+        updated_count = room.messages.filter(
             is_read=False
         ).exclude(sender=user).update(is_read=True)
         
-        return Response({"message": "Messages marked as read"})
+        return Response({
+            "message": f"{updated_count} messages marked as read",
+            "status": "success"
+        })
 
 class MessageViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing messages"""
+    """ViewSet for managing messages - FIXED VERSION"""
     serializer_class = MessageSerializer
     permission_classes = [IsAuthenticated]
 
@@ -3494,118 +5428,135 @@ class MessageViewSet(viewsets.ModelViewSet):
                 
                 # Update room's last message time
                 room.last_message_time = message.created_at
-                room.save()
+                room.save(update_fields=['last_message_time'])
                 
                 # Create notification for other participants
                 other_participants = room.participants.exclude(id=self.request.user.id)
+                
+                # Create notification content
+                notification_content = message.content[:100] if message.content else f"Sent a {message.message_type}"
+                
+                notifications = []
                 for participant in other_participants:
-                    Notification.objects.create(
-                        user=participant,
-                        title=f"New message from {self.request.user.get_full_name() or self.request.user.username}",
-                        message=message.content[:100] if message.content else "New file received",
-                        notification_type='chat',
-                        clearance_form=None
+                    notifications.append(
+                        Notification(
+                            user=participant,
+                            title=f"New message from {self.request.user.get_full_name() or self.request.user.username}",
+                            message=notification_content,
+                            notification_type='chat',
+                            clearance_form=None
+                        )
                     )
+                
+                # Bulk create notifications for better performance
+                if notifications:
+                    Notification.objects.bulk_create(notifications)
+                    
         except ChatRoom.DoesNotExist:
-            raise serializers.ValidationError("Chat room not found")
+            raise serializers.ValidationError({"error": "Chat room not found"})
+        except Exception as e:
+            raise serializers.ValidationError({"error": str(e)})
 
 # ==================== CHAT FUNCTIONS ====================
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_user_chat_rooms(request):
-    """Get chat rooms for the current user"""
+    """Get chat rooms for the current user - FIXED VERSION"""
     user = request.user
     chat_rooms = []
     
+    def get_room_data(room):
+        # Get last message - return string ONLY
+        last_message_obj = room.messages.last()
+        last_message = ""
+        if last_message_obj:
+            last_message = last_message_obj.content[:100] if last_message_obj.content else f"[{last_message_obj.message_type}]"
+        
+        # Get unread count
+        unread_count = room.messages.filter(
+            is_read=False
+        ).exclude(sender=user).count()
+        
+        room_data = {
+            "id": room.id,
+            "name": room.name,
+            "room_type": room.room_type,
+            "last_message": last_message,  # This is a string, NOT an object
+            "last_message_time": room.last_message_time,
+            "unread_count": unread_count,
+            "created_at": room.created_at,
+            "is_active": room.is_active
+        }
+        
+        # Add participant info based on user role
+        if user.role == 'student':
+            other_participant = room.participants.exclude(id=user.id).first()
+            if other_participant:
+                room_data["other_participant"] = {
+                    "id": other_participant.id,
+                    "username": other_participant.username,
+                    "name": other_participant.get_full_name(),
+                    "role": other_participant.role,
+                }
+        else:
+            # Staff view
+            if room.student:
+                room_data["student"] = {
+                    "id": room.student.id,
+                    "username": room.student.username,
+                    "name": room.student.get_full_name(),
+                    "email": room.student.email,
+                }
+            room_data["student_name"] = room.student.get_full_name() if room.student else "Unknown Student"
+            room_data["student_email"] = room.student.email if room.student else ""
+        
+        return room_data
+    
     if user.role == 'student':
-        # Get rooms where user is a participant
         rooms = ChatRoom.objects.filter(
             participants=user,
             is_active=True
         ).order_by('-last_message_time')
-        
-        for room in rooms:
-            # Get last message
-            last_message = room.messages.last()
-            # Get unread count
-            unread_count = room.messages.filter(
-                is_read=False
-            ).exclude(sender=user).count()
-            
-            # Get other participant info
-            other_participant = room.participants.exclude(id=user.id).first()
-            
-            chat_rooms.append({
-                "id": room.id,
-                "name": room.name,
-                "room_type": room.room_type,
-                "other_participant": {
-                    "id": other_participant.id if other_participant else None,
-                    "username": other_participant.username if other_participant else None,
-                    "name": other_participant.get_full_name() if other_participant else None,
-                    "role": other_participant.role if other_participant else None
-                },
-                "last_message": last_message.content if last_message else "",
-                "last_message_time": room.last_message_time,
-                "unread_count": unread_count,
-                "created_at": room.created_at
-            })
+        chat_rooms = [get_room_data(room) for room in rooms]
     
     elif user.role == 'departmenthead':
-        # Get rooms where user is the specific staff
         rooms = ChatRoom.objects.filter(
             specific_staff=user,
             is_active=True
         ).order_by('-last_message_time')
-        
-        for room in rooms:
-            # Get last message
-            last_message = room.messages.last()
-            # Get unread count
-            unread_count = room.messages.filter(
-                is_read=False
-            ).exclude(sender=user).count()
-            
-            chat_rooms.append({
-                "id": room.id,
-                "name": room.name,
-                "room_type": room.room_type,
-                "student": {
-                    "id": room.student.id if room.student else None,
-                    "username": room.student.username if room.student else None,
-                    "name": room.student.get_full_name() if room.student else None,
-                    "email": room.student.email if room.student else None
-                },
-                "last_message": last_message.content if last_message else "",
-                "last_message_time": room.last_message_time,
-                "unread_count": unread_count,
-                "created_at": room.created_at
-            })
+        chat_rooms = [get_room_data(room) for room in rooms]
     
-    return Response(chat_rooms)
-
+    return Response(chat_rooms)  # Return array directly
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def start_chat_with_department(request):
-    user = request.user
-    if user.role != 'student':
+    """Student starts a chat with a department"""
+    if request.user.role != 'student':
         return Response({"error": "Only students can start chats"}, status=403)
 
+    user = request.user
     room_type = request.data.get('room_type')
+    
     if not room_type:
         return Response({"error": "room_type is required"}, status=400)
 
     # Determine the staff based on room_type
     staff_user = None
+    
     if room_type == 'student_department_head':
         if not user.department:
-            return Response({"error": "Student has no department assigned"}, status=400)
+            return Response({"error": "You don't have a department assigned"}, status=400)
+        
         staff_user = User.objects.filter(
             role='departmenthead',
             department=user.department,
             is_active=True
         ).first()
+        
+        if not staff_user:
+            return Response({"error": f"No department head found for {user.department.name}"}, status=404)
+            
     elif room_type == 'student_librarian':
         staff_user = User.objects.filter(role='librarian', is_active=True).first()
     elif room_type == 'student_cafeteria':
@@ -3616,7 +5567,7 @@ def start_chat_with_department(request):
         staff_user = User.objects.filter(role='registrar', is_active=True).first()
 
     if not staff_user:
-        return Response({"error": "No staff available"}, status=404)
+        return Response({"error": "No staff member available"}, status=404)
 
     # Check if chat already exists
     existing_chat = ChatRoom.objects.filter(
@@ -3627,48 +5578,147 @@ def start_chat_with_department(request):
     ).first()
 
     if existing_chat:
+        serializer = ChatRoomSerializer(existing_chat, context={'request': request})
         return Response({
             "message": "Chat already exists",
-            "chat_room": {"id": existing_chat.id, "name": existing_chat.name, "room_type": existing_chat.room_type}
+            "chat_room": serializer.data
         })
 
     # Create new chat room
     chat_room = ChatRoom.objects.create(
-        name=f"{user.get_full_name()} - {staff_user.get_full_name()}",
+        name=f"{user.get_full_name() or user.username} - {staff_user.get_full_name() or staff_user.username}",
         room_type=room_type,
         student=user,
         department=user.department,
         specific_staff=staff_user,
         is_active=True
     )
+    
+    # Add participants
     chat_room.participants.add(user, staff_user)
     
-    # Welcome message
+    # Create welcome message
     welcome_msg = Message.objects.create(
         room=chat_room,
         sender=staff_user,
-        content=f"Hello {user.get_full_name()}! This is {staff_user.get_full_name()} from {staff_user.role.replace('departmenthead', 'Department Head')}. How can I help you?"
+        message_type='text',
+        content=f"Hello {user.get_full_name() or user.username}! This is {staff_user.get_full_name() or staff_user.username} from {staff_user.role.replace('departmenthead', 'Department Head').title()}. How can I help you with your clearance?"
     )
+    
     chat_room.last_message_time = welcome_msg.created_at
     chat_room.save()
+    
+    # Create notification for staff
+    Notification.objects.create(
+        user=staff_user,
+        title="New Chat Request",
+        message=f"Student {user.get_full_name() or user.username} started a chat with you.",
+        notification_type='chat'
+    )
 
+    serializer = ChatRoomSerializer(chat_room, context={'request': request})
+    
     return Response({
         "message": "Chat started successfully",
-        "chat_room": {
-            "id": chat_room.id,
-            "name": chat_room.name,
-            "room_type": chat_room.room_type,
-            "student": {"id": user.id, "name": user.get_full_name()},
-            "staff": {"id": staff_user.id, "name": staff_user.get_full_name()},
-            "last_message": welcome_msg.content,
-            "last_message_time": chat_room.last_message_time
-        }
+        "chat_room": serializer.data
     }, status=201)
+    
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def staff_start_chat_with_student(request):
+    """Staff starts a chat with a student"""
+    staff_roles = ['departmenthead', 'librarian', 'cafeteria', 'dormitory', 'registrar']
+    
+    if request.user.role not in staff_roles:
+        return Response({"error": "Unauthorized - Staff only"}, status=403)
+
+    student_id = request.data.get('student_id')
+    if not student_id:
+        return Response({"error": "Student ID required"}, status=400)
+
+    try:
+        student = User.objects.get(id=student_id, role='student')
+        staff = request.user
+        
+        # Determine room type based on staff role
+        room_type_map = {
+            'departmenthead': 'student_department_head',
+            'librarian': 'student_librarian',
+            'cafeteria': 'student_cafeteria',
+            'dormitory': 'student_dormitory',
+            'registrar': 'student_registrar'
+        }
+        
+        room_type = room_type_map.get(staff.role)
+        
+        if not room_type:
+            return Response({"error": "Invalid staff role"}, status=400)
+        
+        # Check if chat already exists
+        existing_chat = ChatRoom.objects.filter(
+            student=student,
+            specific_staff=staff,
+            room_type=room_type,
+            is_active=True
+        ).first()
+
+        if existing_chat:
+            serializer = ChatRoomSerializer(existing_chat, context={'request': request})
+            return Response({
+                "message": "Chat already exists",
+                "chat_room": serializer.data
+            })
+
+        # Create new chat room
+        chat_room = ChatRoom.objects.create(
+            name=f"{student.get_full_name() or student.username} - {staff.get_full_name() or staff.username}",
+            room_type=room_type,
+            student=student,
+            department=student.department,
+            specific_staff=staff,
+            is_active=True
+        )
+        
+        # Add participants
+        chat_room.participants.add(student, staff)
+        
+        # Create welcome message
+        welcome_msg = Message.objects.create(
+            room=chat_room,
+            sender=staff,
+            message_type='text',
+            content=f"Hello {student.get_full_name() or student.username}! This is {staff.get_full_name() or staff.username} from {staff.role.title()}. How can I help you with your clearance?"
+        )
+        
+        chat_room.last_message_time = welcome_msg.created_at
+        chat_room.save()
+        
+        # Create notification for student
+        Notification.objects.create(
+            user=student,
+            title="New Chat Request",
+            message=f"{staff.get_full_name() or staff.username} from {staff.role.title()} started a chat with you.",
+            notification_type='chat'
+        )
+
+        serializer = ChatRoomSerializer(chat_room, context={'request': request})
+        
+        return Response({
+            "message": "Chat started successfully",
+            "chat_room": serializer.data
+        }, status=201)
+        
+    except User.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+    except Exception as e:
+        return Response({"error": f"Failed to start chat: {str(e)}"}, status=500)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_chat_messages(request, room_id):
-    """Get messages for a specific chat room"""
+    """Get messages for a specific chat room with pagination"""
     try:
         chat_room = ChatRoom.objects.get(id=room_id, is_active=True)
         user = request.user
@@ -3677,38 +5727,45 @@ def get_chat_messages(request, room_id):
         if user not in chat_room.participants.all():
             return Response({"error": "You are not a participant in this chat"}, status=403)
         
-        # Mark unread messages as read (excluding user's own messages)
+        # FIRST: Mark unread messages as read - DO THIS BEFORE PAGINATION/SLICING
         Message.objects.filter(
             room=chat_room,
             is_read=False
         ).exclude(sender=user).update(is_read=True)
         
-        # Get messages
-        messages = chat_room.messages.all().order_by('created_at')
+        # Pagination
+        page = int(request.GET.get('page', 1))
+        page_size = int(request.GET.get('page_size', 50))
+        start = (page - 1) * page_size
+        end = start + page_size
         
-        # Format messages
-        formatted_messages = []
-        for message in messages:
-            formatted_messages.append({
-                "id": message.id,
-                "content": message.content,
-                "sender": {
-                    "id": message.sender.id if message.sender else None,
-                    "username": message.sender.username if message.sender else None,
-                    "name": message.sender.get_full_name() if message.sender else None,
-                    "role": message.sender.role if message.sender else None
-                },
-                "file": message.file.url if message.file else None,
-                "is_read": message.is_read,
-                "created_at": message.created_at,
-                "is_own": message.sender == user
-            })
+        # Get messages
+        messages = chat_room.messages.all().order_by('-created_at')
+        total_messages = messages.count()
+        messages_page = messages[start:end]
+        serializer = MessageSerializer(
+            messages_page, 
+            many=True, 
+            context={'request': request}
+        )
+        
+        # Get room info
+        room_serializer = ChatRoomSerializer(
+            chat_room, 
+            context={'request': request}
+        )
         
         return Response({
-            'room_id': chat_room.id,
-            'room_name': chat_room.name,
-            'messages': formatted_messages,
-            'total_messages': messages.count()
+            'room': room_serializer.data,
+            'messages': serializer.data,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total_messages + page_size - 1) // page_size,
+                'total_messages': total_messages,
+                'has_next': end < total_messages,
+                'has_previous': page > 1
+            }
         })
         
     except ChatRoom.DoesNotExist:
@@ -3716,41 +5773,149 @@ def get_chat_messages(request, room_id):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def send_message(request):
+    """Send a message with support for text, images, audio, video, and files - FIXED VERSION"""
     room_id = request.data.get('room_id')
-    content = request.data.get('content')
-    file = request.FILES.get('file')
-
-    if not room_id or (not content and not file):
-        return Response({"error": "room_id and content or file required"}, status=400)
+    content = request.data.get('content', '')
+    message_type = request.data.get('message_type', 'text')
+    reply_to_id = request.data.get('reply_to')
+    
+    if not room_id:
+        return Response({"error": "room_id is required"}, status=400)
 
     try:
         chat_room = ChatRoom.objects.get(id=room_id, is_active=True)
         user = request.user
+        
+        # Check if user is a participant
         if user not in chat_room.participants.all():
-            return Response({"error": "Not a participant"}, status=403)
-
-        message = Message.objects.create(
-            room=chat_room,
-            sender=user,
-            content=content or "",
-            file=file
-        )
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        # Handle different message types
+        message_data = {
+            'room': chat_room,
+            'sender': user,
+            'message_type': message_type,
+            'content': content
+        }
+        
+        # Handle reply
+        if reply_to_id:
+            try:
+                reply_to_msg = Message.objects.get(id=reply_to_id)
+                message_data['reply_to'] = reply_to_msg
+            except Message.DoesNotExist:
+                pass
+        
+        # Handle file uploads based on message type
+        if message_type == 'image':
+            if 'image_file' in request.FILES:
+                image_file = request.FILES['image_file']
+                message_data['image_file'] = image_file
+                message_data['file_name'] = image_file.name
+                message_data['file_size'] = image_file.size
+                
+                # Generate thumbnail for image
+                try:
+                    from PIL import Image
+                    from io import BytesIO
+                    from django.core.files.base import ContentFile
+                    
+                    img = Image.open(image_file)
+                    img.thumbnail((200, 200))
+                    thumb_io = BytesIO()
+                    img.save(thumb_io, format='JPEG', quality=85)
+                    
+                    message_data['thumbnail'] = ContentFile(
+                        thumb_io.getvalue(),
+                        name=f"thumb_{image_file.name}"
+                    )
+                except Exception as e:
+                    print(f"Thumbnail generation failed: {e}")
+                    
+        elif message_type == 'audio':
+            if 'audio_file' in request.FILES:
+                audio_file = request.FILES['audio_file']
+                message_data['audio_file'] = audio_file
+                message_data['file_name'] = audio_file.name
+                message_data['file_size'] = audio_file.size
+                
+                # Get duration if provided
+                duration = request.data.get('duration')
+                if duration:
+                    try:
+                        message_data['duration'] = float(duration)
+                    except ValueError:
+                        pass
+                        
+        elif message_type == 'video':
+            if 'video_file' in request.FILES:
+                video_file = request.FILES['video_file']
+                message_data['video_file'] = video_file
+                message_data['file_name'] = video_file.name
+                message_data['file_size'] = video_file.size
+                
+                # Get duration if provided
+                duration = request.data.get('duration')
+                if duration:
+                    try:
+                        message_data['duration'] = float(duration)
+                    except ValueError:
+                        pass
+                        
+        elif message_type == 'file':
+            if 'file' in request.FILES:
+                file_obj = request.FILES['file']
+                message_data['file'] = file_obj
+                message_data['file_name'] = file_obj.name
+                message_data['file_size'] = file_obj.size
+        
+        # Create message
+        message = Message.objects.create(**message_data)
+        
+        # Update room's last message time
         chat_room.last_message_time = message.created_at
-        chat_room.save()
-
+        chat_room.save(update_fields=['last_message_time'])
+        
+        # Create notifications for other participants
+        other_participants = chat_room.participants.exclude(id=user.id)
+        
+        notification_content = content[:100] if content else f"Sent a {message_type}"
+        if not content and message_type != 'text':
+            notification_content = f"Sent a {message_type}"
+        
+        notifications = []
+        for participant in other_participants:
+            notifications.append(
+                Notification(
+                    user=participant,
+                    title=f"New message from {user.get_full_name() or user.username}",
+                    message=notification_content,
+                    notification_type='chat'
+                )
+            )
+        
+        if notifications:
+            Notification.objects.bulk_create(notifications)
+        
+        # Serialize and return
+        serializer = MessageSerializer(message, context={'request': request})
+        
         return Response({
-            "message": "Message sent",
-            "message_id": message.id,
-            "content": message.content,
-            "sender": {"id": user.id, "name": user.get_full_name()},
-            "created_at": message.created_at,
-            "is_own": True
+            "status": "success",
+            "message": "Message sent successfully",
+            "data": serializer.data
         }, status=201)
+        
     except ChatRoom.DoesNotExist:
         return Response({"error": "Chat room not found"}, status=404)
-
-
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=500)
+    
+    
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def department_staff_list(request):
@@ -3895,55 +6060,340 @@ def get_unread_message_count(request):
     """Get unread message count for user"""
     user = request.user
     
-    # Get all active chat rooms where user is a participant
     chat_rooms = ChatRoom.objects.filter(
         participants=user,
         is_active=True
     )
     
     total_unread = 0
+    rooms_data = []
+    
     for room in chat_rooms:
-        total_unread += room.messages.filter(
+        unread_count = room.messages.filter(
             is_read=False
         ).exclude(sender=user).count()
+        
+        total_unread += unread_count
+        
+        rooms_data.append({
+            'room_id': room.id,
+            'room_name': room.name,
+            'unread_count': unread_count,
+            'last_message_time': room.last_message_time
+        })
     
     return Response({
-        "unread_count": total_unread,
-        "user_id": user.id,
-        "username": user.username
+        'user_id': user.id,
+        'total_unread': total_unread,
+        'rooms': rooms_data
     })
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def mark_messages_as_read(request):
-    """Mark all messages in a room as read"""
+    """Mark messages in a room as read"""
     room_id = request.data.get('room_id')
+    message_ids = request.data.get('message_ids', [])
     
-    if not room_id:
-        return Response({"error": "room_id is required"}, status=400)
+    if not room_id and not message_ids:
+        return Response({"error": "room_id or message_ids required"}, status=400)
+    
+    user = request.user
     
     try:
-        chat_room = ChatRoom.objects.get(id=room_id)
-        user = request.user
-        
-        # Check if user is a participant
-        if user not in chat_room.participants.all():
-            return Response({"error": "You are not a participant in this chat"}, status=403)
-        
-        # Mark all unread messages as read (excluding user's own messages)
-        Message.objects.filter(
-            room=chat_room,
-            is_read=False
-        ).exclude(sender=user).update(is_read=True)
-        
-        return Response({
-            "message": "Messages marked as read",
-            "room_id": room_id,
-            "user_id": user.id
-        })
-        
+        if room_id:
+            chat_room = ChatRoom.objects.get(id=room_id)
+            
+            if user not in chat_room.participants.all():
+                return Response({"error": "Not a participant"}, status=403)
+            
+            messages = chat_room.messages.filter(
+                is_read=False
+            ).exclude(sender=user)
+            
+            for msg in messages:
+                msg.mark_as_read(user)
+                
+            return Response({
+                "message": f"Marked {messages.count()} messages as read",
+                "count": messages.count()
+            })
+            
+        elif message_ids:
+            messages = Message.objects.filter(id__in=message_ids)
+            
+            for msg in messages:
+                if user in msg.room.participants.all():
+                    msg.mark_as_read(user)
+            
+            return Response({
+                "message": f"Marked {len(message_ids)} messages as read"
+            })
+            
     except ChatRoom.DoesNotExist:
         return Response({"error": "Chat room not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_department_staff_list(request):
+    """Get available staff for student to chat with"""
+    if request.user.role != 'student':
+        return Response({"error": "Only students can access this"}, status=403)
+    
+    student = request.user
+    staff_list = []
+    
+    # Department Head
+    if student.department:
+        dept_head = User.objects.filter(
+            role='departmenthead',
+            department=student.department,
+            is_active=True
+        ).first()
+        
+        staff_list.append({
+            'role': 'department_head',
+            'room_type': 'student_department_head',
+            'name': 'Department Head',
+            'department': student.department.name if student.department else None,
+            'available': dept_head is not None,
+            'staff': {
+                'id': dept_head.id if dept_head else None,
+                'name': dept_head.get_full_name() if dept_head else None,
+                'email': dept_head.email if dept_head else None
+            } if dept_head else None,
+            'icon': '👨‍🏫',
+            'description': f'Chat with your department head about clearance requirements'
+        })
+    
+    # Librarian
+    librarian = User.objects.filter(role='librarian', is_active=True).first()
+    staff_list.append({
+        'role': 'librarian',
+        'room_type': 'student_librarian',
+        'name': 'Librarian',
+        'available': librarian is not None,
+        'staff': {
+            'id': librarian.id if librarian else None,
+            'name': librarian.get_full_name() if librarian else None,
+            'email': librarian.email if librarian else None
+        } if librarian else None,
+        'icon': '📚',
+        'description': 'Chat about library books, dues, and fines'
+    })
+    
+    # Cafeteria
+    cafeteria = User.objects.filter(role='cafeteria', is_active=True).first()
+    staff_list.append({
+        'role': 'cafeteria',
+        'room_type': 'student_cafeteria',
+        'name': 'Cafeteria',
+        'available': cafeteria is not None,
+        'staff': {
+            'id': cafeteria.id if cafeteria else None,
+            'name': cafeteria.get_full_name() if cafeteria else None,
+            'email': cafeteria.email if cafeteria else None
+        } if cafeteria else None,
+        'icon': '🍽️',
+        'description': 'Chat about meal dues and cafeteria issues'
+    })
+    
+    # Dormitory
+    dormitory = User.objects.filter(role='dormitory', is_active=True).first()
+    staff_list.append({
+        'role': 'dormitory',
+        'room_type': 'student_dormitory',
+        'name': 'Dormitory',
+        'available': dormitory is not None,
+        'staff': {
+            'id': dormitory.id if dormitory else None,
+            'name': dormitory.get_full_name() if dormitory else None,
+            'email': dormitory.email if dormitory else None
+        } if dormitory else None,
+        'icon': '🏠',
+        'description': 'Chat about dormitory damages and accommodation'
+    })
+    
+    # Registrar
+    registrar = User.objects.filter(role='registrar', is_active=True).first()
+    staff_list.append({
+        'role': 'registrar',
+        'room_type': 'student_registrar',
+        'name': 'Registrar',
+        'available': registrar is not None,
+        'staff': {
+            'id': registrar.id if registrar else None,
+            'name': registrar.get_full_name() if registrar else None,
+            'email': registrar.email if registrar else None
+        } if registrar else None,
+        'icon': '📋',
+        'description': 'Chat about final clearance and certificates'
+    })
+    
+    return Response(staff_list)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_students_for_staff(request):
+    """Get list of students for department head/staff"""
+    user = request.user
+    
+    if user.role not in ['departmenthead', 'librarian', 'cafeteria', 'dormitory', 'registrar']:
+        return Response({"error": "Unauthorized"}, status=403)
+    
+    # Filter students based on department for department head
+    if user.role == 'departmenthead':
+        students = User.objects.filter(
+            role='student',
+            department=user.department,
+            is_active=True
+        ).order_by('first_name', 'last_name')
+    else:
+        # For other staff, get all students
+        students = User.objects.filter(
+            role='student',
+            is_active=True
+        ).order_by('first_name', 'last_name')
+    
+    result = []
+    for student in students[:50]:  # Limit to 50 students
+        # Check if chat exists
+        existing_chat = ChatRoom.objects.filter(
+            student=student,
+            specific_staff=user,
+            is_active=True
+        ).first()
+        
+        result.append({
+            'id': student.id,
+            'full_name': student.get_full_name() or student.username,
+            'username': student.username,
+            'email': student.email,
+            'id_number': getattr(student, 'id_number', 'N/A'),
+            'program': getattr(student, 'program_level', 'N/A'),
+            'department': student.department.name if student.department else None,
+            'has_existing_chat': existing_chat is not None,
+            'chat_room_id': existing_chat.id if existing_chat else None,
+            'last_login': student.last_login
+        })
+    
+    return Response(result)
+
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_message(request, message_id):
+    """Delete a message"""
+    try:
+        message = Message.objects.get(id=message_id)
+        
+        if message.sender != request.user:
+            return Response({"error": "You can only delete your own messages"}, status=403)
+        
+        # Delete associated files
+        if message.image_file:
+            message.image_file.delete(save=False)
+        if message.audio_file:
+            message.audio_file.delete(save=False)
+        if message.video_file:
+            message.video_file.delete(save=False)
+        if message.file:
+            message.file.delete(save=False)
+        if message.thumbnail:
+            message.thumbnail.delete(save=False)
+        
+        message.delete()
+        
+        return Response({"message": "Message deleted successfully"})
+        
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def stream_media(request, message_id):
+    """Stream audio/video files"""
+    try:
+        message = Message.objects.get(id=message_id)
+        user = request.user
+        
+        # Check if user is participant
+        if user not in message.room.participants.all():
+            return Response({"error": "Unauthorized"}, status=403)
+        
+        # Get file path
+        if message.audio_file:
+            file_path = message.audio_file.path
+            content_type = 'audio/mpeg'
+        elif message.video_file:
+            file_path = message.video_file.path
+            content_type = 'video/mp4'
+        else:
+            return Response({"error": "No media file found"}, status=404)
+        
+        # Stream file
+        if os.path.exists(file_path):
+            response = FileResponse(
+                open(file_path, 'rb'),
+                content_type=content_type
+            )
+            response['Content-Disposition'] = f'inline; filename="{os.path.basename(file_path)}"'
+            return response
+        else:
+            return Response({"error": "File not found"}, status=404)
+            
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_file(request, message_id):
+    """Download file from message"""
+    try:
+        message = Message.objects.get(id=message_id)
+        user = request.user
+        
+        # Check if user is participant
+        if user not in message.room.participants.all():
+            return Response({"error": "Unauthorized"}, status=403)
+        
+        # Get file path
+        if message.file:
+            file_path = message.file.path
+            content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+        elif message.image_file:
+            file_path = message.image_file.path
+            content_type = mimetypes.guess_type(file_path)[0] or 'image/jpeg'
+        elif message.audio_file:
+            file_path = message.audio_file.path
+            content_type = mimetypes.guess_type(file_path)[0] or 'audio/mpeg'
+        elif message.video_file:
+            file_path = message.video_file.path
+            content_type = mimetypes.guess_type(file_path)[0] or 'video/mp4'
+        else:
+            return Response({"error": "No file found"}, status=404)
+        
+        # Download file
+        if os.path.exists(file_path):
+            response = FileResponse(
+                open(file_path, 'rb'),
+                content_type=content_type
+            )
+            filename = message.file_name or os.path.basename(file_path)
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return response
+        else:
+            return Response({"error": "File not found"}, status=404)
+            
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
 
 class DepartmentStaffView(APIView):
     permission_classes = [IsAuthenticated]
@@ -3959,34 +6409,18 @@ class DepartmentStaffView(APIView):
 def student_get_chat_rooms(request):
     """Get chat rooms for student"""
     if request.user.role != 'student':
-        return Response({"error": "Only students can access this"}, status=403)
+        return Response({"error": "Unauthorized - Student only"}, status=403)
     
     student = request.user
     rooms = ChatRoom.objects.filter(
         student=student,
         is_active=True
+    ).prefetch_related(
+        Prefetch('messages', queryset=Message.objects.order_by('-created_at')[:1], to_attr='last_msg')
     ).order_by('-last_message_time')
     
-    chat_rooms = []
-    for room in rooms:
-        # Get last message
-        last_message = room.messages.last()
-        # Get unread count
-        unread_count = room.messages.filter(is_read=False).exclude(sender=student).count()
-        
-        chat_rooms.append({
-            "id": room.id,
-            "name": room.name,
-            "room_type": room.room_type,
-            "staff_name": room.specific_staff.get_full_name() if room.specific_staff else None,
-            "staff_role": room.specific_staff.role if room.specific_staff else None,
-            "last_message": last_message.content if last_message else "",
-            "last_message_time": room.last_message_time,
-            "unread_count": unread_count,
-            "created_at": room.created_at
-        })
-    
-    return Response(chat_rooms)
+    serializer = ChatRoomSerializer(rooms, many=True, context={'request': request})
+    return Response(serializer.data)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -4003,45 +6437,99 @@ def student_start_chat(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def department_head_get_chat_rooms(request):
-    """Get chat rooms for department head - Only show students from their department"""
-    if request.user.role != 'departmenthead':
-        return Response({"error": "Only department heads can access this"}, status=403)
+    """Get chat rooms for department head - FIXED VERSION"""
+    user = request.user
     
-    department_head = request.user
+    if user.role != 'departmenthead':
+        return Response({"error": "Unauthorized"}, status=403)
     
-    # Check if department head has a department assigned
-    if not department_head.department:
-        return Response({"error": "No department assigned to this user"}, status=400)
-    
-    # Get chat rooms only for students in the same department
     rooms = ChatRoom.objects.filter(
-        specific_staff=department_head,
-        student__department=department_head.department,  # Filter by student's department
+        specific_staff=user,
         is_active=True
     ).order_by('-last_message_time')
     
-    chat_rooms = []
+    result = []
     for room in rooms:
-        # Get last message
-        last_message = room.messages.last()
-        # Get unread count
-        unread_count = room.messages.filter(is_read=False).exclude(sender=department_head).count()
+        # Get last message as string
+        last_msg = room.messages.last()
+        last_message = ""
+        if last_msg:
+            last_message = last_msg.content[:100] if last_msg.content else f"[{last_msg.message_type}]"
         
-        chat_rooms.append({
+        # Get unread count
+        unread_count = room.messages.filter(
+            is_read=False
+        ).exclude(sender=user).count()
+        
+        result.append({
             "id": room.id,
             "name": room.name,
-            "student_id": room.student.id if room.student else None,
-            "student_name": room.student.get_full_name() if room.student else "Unknown",
-            "student_email": room.student.email if room.student else None,
-            "student_id_number": room.student.id_number if room.student else None,
-            "student_department": room.student.department.name if room.student and room.student.department else None,
-            "last_message": last_message.content if last_message else "",
+            "room_type": room.room_type,
+            "last_message": last_message,  # This is a string
             "last_message_time": room.last_message_time,
             "unread_count": unread_count,
+            "student_name": room.student.get_full_name() if room.student else "Unknown Student",
+            "student_email": room.student.email if room.student else "",
+            "student_id": room.student.id if room.student else None,
             "created_at": room.created_at
         })
     
-    return Response(chat_rooms)
+    return Response(result)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def staff_get_chat_rooms(request, role):
+    """Generic staff get chat rooms"""
+    staff_roles = ['librarian', 'cafeteria', 'dormitory', 'registrar']
+    
+    if request.user.role not in staff_roles:
+        return Response({"error": "Unauthorized - Staff only"}, status=403)
+    
+    staff = request.user
+    
+    # Map role to room type
+    room_type_map = {
+        'librarian': 'student_librarian',
+        'cafeteria': 'student_cafeteria', 
+        'dormitory': 'student_dormitory',
+        'registrar': 'student_registrar'
+    }
+    
+    room_type = room_type_map.get(request.user.role)
+    
+    rooms = ChatRoom.objects.filter(
+        Q(specific_staff=staff) | Q(participants=staff),
+        is_active=True
+    )
+    
+    if room_type:
+        rooms = rooms.filter(room_type=room_type)
+    
+    rooms = rooms.distinct().prefetch_related(
+        Prefetch('messages', queryset=Message.objects.order_by('-created_at')[:1], to_attr='last_msg')
+    ).order_by('-last_message_time')
+    
+    serializer = ChatRoomSerializer(rooms, many=True, context={'request': request})
+    return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_chat_rooms_by_role(request):
+    """Get chat rooms based on user role"""
+    user = request.user
+    
+    if user.role == 'student':
+        return student_get_chat_rooms(request)
+    elif user.role == 'departmenthead':
+        return department_head_get_chat_rooms(request)
+    elif user.role in ['librarian', 'cafeteria', 'dormitory', 'registrar']:
+        return staff_get_chat_rooms(request, user.role)
+    else:
+        return Response({"error": "Role not supported"}, status=400)
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def department_head_get_students(request):
@@ -4119,183 +6607,181 @@ def get_department_heads(request):
 
 
 # ==================== CHAT ENDPOINTS FOR DORMITORY ====================
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def dormitory_get_chat_rooms(request):
-    """Get chat rooms for dormitory staff - Only show students they're chatting with"""
-    if request.user.role != 'dormitory':
-        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    """Get chat rooms for dormitory staff"""
+    user = request.user
     
-    dormitory_staff = request.user
+    if user.role != 'dormitory':
+        return Response({"error": "Unauthorized"}, status=403)
     
-    # Get chat rooms where this dormitory staff is a participant
     rooms = ChatRoom.objects.filter(
-        Q(specific_staff=dormitory_staff) | Q(participants=dormitory_staff),
-        is_active=True,
-        room_type__in=['student_dormitory', 'student_general']
-    ).distinct().order_by('-last_message_time')
+        specific_staff=user,
+        is_active=True
+    ).order_by('-last_message_time')
     
-    chat_rooms = []
+    result = []
     for room in rooms:
-        # Get student info
-        student = room.student
+        # Get last message as string
+        last_msg = room.messages.last()
+        last_message = ""
+        if last_msg:
+            last_message = last_msg.content[:100] if last_msg.content else f"[{last_msg.message_type}]"
         
-        # Get last message
-        last_message = room.messages.last()
-        
-        # Get unread count (messages not from this user)
+        # Get unread count
         unread_count = room.messages.filter(
             is_read=False
-        ).exclude(sender=dormitory_staff).count()
+        ).exclude(sender=user).count()
         
-        chat_rooms.append({
+        result.append({
             "id": room.id,
-            "student_id": student.id if student else None,
-            "student_name": student.get_full_name() if student else "Unknown",
-            "student_email": student.email if student else None,
-            "student_id_number": student.id_number if student and hasattr(student, 'id_number') else None,
-            "last_message": last_message.content if last_message else "",
+            "name": room.name,
+            "room_type": room.room_type,
+            "last_message": last_message,  # This is a string
             "last_message_time": room.last_message_time,
             "unread_count": unread_count,
+            "student_id": room.student.id if room.student else None,
+            "student_name": room.student.get_full_name() if room.student else "Unknown Student",
+            "student_email": room.student.email if room.student else "",
+            "student_username": room.student.username if room.student else "",
             "created_at": room.created_at
         })
     
-    return Response(chat_rooms)
+    return Response(result)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def dormitory_get_students(request):
-    """Get students for dormitory staff to chat with"""
-    if request.user.role != 'dormitory':
-        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    """Get list of students for dormitory staff to start chats"""
+    user = request.user
     
-    dormitory_staff = request.user
+    if user.role != 'dormitory':
+        return Response({"error": "Unauthorized"}, status=403)
     
-    # Get all clearance forms that have reached or passed cafeteria approval
-    forms = ClearanceForm.objects.filter(
-        status__in=['approved_cafeteria', 'approved_dormitory', 'requires_dormitory_payment', 'rejected']
-    )
+    # Get all active students
+    students = User.objects.filter(
+        role='student',
+        is_active=True
+    ).order_by('first_name', 'last_name')
     
-    # Get unique students from these forms
-    student_ids = set()
-    students_list = []
+    result = []
+    for student in students[:50]:  # Limit to 50 students for performance
+        # Check if chat already exists with this student
+        existing_chat = ChatRoom.objects.filter(
+            student=student,
+            specific_staff=user,
+            room_type='student_dormitory',
+            is_active=True
+        ).first()
+        
+        # Get unread count if chat exists
+        unread_count = 0
+        if existing_chat:
+            unread_count = existing_chat.messages.filter(
+                is_read=False
+            ).exclude(sender=user).count()
+        
+        result.append({
+            'id': student.id,
+            'full_name': student.get_full_name() or student.username,
+            'username': student.username,
+            'email': student.email,
+            'id_number': getattr(student, 'id_number', 'N/A'),
+            'program': getattr(student, 'program_level', 'N/A'),
+            'department': student.department.name if student.department else None,
+            'has_existing_chat': existing_chat is not None,
+            'chat_room_id': existing_chat.id if existing_chat else None,
+            'unread_count': unread_count,
+            'last_login': student.last_login
+        })
     
-    for form in forms:
-        if form.student and form.student.id not in student_ids:
-            student_ids.add(form.student.id)
-            
-            # Check if there's an existing chat
-            existing_chat = ChatRoom.objects.filter(
-                student=form.student,
-                specific_staff=dormitory_staff,
-                is_active=True,
-                room_type='student_dormitory'
-            ).first()
-            
-            students_list.append({
-                'id': form.student.id,
-                'name': form.student.get_full_name(),
-                'username': form.student.username,
-                'email': form.student.email,
-                'id_number': form.id_number,
-                'has_existing_chat': existing_chat is not None,
-                'chat_room_id': existing_chat.id if existing_chat else None
-            })
-    
-    return Response({
-        'role': 'dormitory',
-        'staff_name': dormitory_staff.get_full_name(),
-        'total_students': len(students_list),
-        'students': students_list
-    })
+    return Response(result)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def dormitory_start_chat(request):
     """Dormitory staff starts a chat with a student"""
-    if request.user.role != 'dormitory':
-        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    user = request.user
     
+    if user.role != 'dormitory':
+        return Response({"error": "Unauthorized"}, status=403)
+
     student_id = request.data.get('student_id')
     if not student_id:
         return Response({"error": "Student ID required"}, status=400)
-    
+
     try:
         student = User.objects.get(id=student_id, role='student')
-        dormitory_staff = request.user
+        staff = user
         
         # Check if chat already exists
         existing_chat = ChatRoom.objects.filter(
             student=student,
-            specific_staff=dormitory_staff,
+            specific_staff=staff,
             room_type='student_dormitory',
             is_active=True
         ).first()
-        
+
         if existing_chat:
             return Response({
                 "message": "Chat already exists",
-                "chat_room": {
-                    "id": existing_chat.id,
-                    "name": existing_chat.name,
-                    "student_name": student.get_full_name()
-                }
+                "chat_room_id": existing_chat.id,
+                "room_id": existing_chat.id
             })
-        
+
         # Create new chat room
-        room_name = f"Dormitory Chat - {student.get_full_name()}"
-        
         chat_room = ChatRoom.objects.create(
-            name=room_name,
+            name=f"{student.get_full_name() or student.username} - Dormitory",
             room_type='student_dormitory',
             student=student,
-            specific_staff=dormitory_staff,
+            department=student.department,
+            specific_staff=staff,
             is_active=True
         )
         
         # Add participants
-        chat_room.participants.add(student, dormitory_staff)
+        chat_room.participants.add(student, staff)
         
         # Create welcome message
-        welcome_message = Message.objects.create(
+        welcome_msg = Message.objects.create(
             room=chat_room,
-            sender=dormitory_staff,
-            content=f"Hello {student.get_full_name()}! This is {dormitory_staff.get_full_name()} from Dormitory department. How can I help you with your clearance?"
+            sender=staff,
+            message_type='text',
+            content=f"Hello {student.get_full_name() or student.username}! This is {staff.get_full_name() or staff.username} from Dormitory. How can I help you with your clearance?"
         )
         
-        # Update last message time
-        chat_room.last_message_time = welcome_message.created_at
+        chat_room.last_message_time = welcome_msg.created_at
         chat_room.save()
         
         # Create notification for student
         Notification.objects.create(
             user=student,
-            message=f"Dormitory staff {dormitory_staff.get_full_name()} started a chat with you",
-            clearance_form=None
+            title="New Chat Request",
+            message=f"{staff.get_full_name() or staff.username} from Dormitory started a chat with you.",
+            notification_type='chat'
         )
-        
+
         return Response({
             "message": "Chat started successfully",
-            "chat_room": {
-                "id": chat_room.id,
-                "name": chat_room.name,
-                "student": {
-                    "id": student.id,
-                    "name": student.get_full_name(),
-                    "email": student.email
-                },
-                "staff": {
-                    "id": dormitory_staff.id,
-                    "name": dormitory_staff.get_full_name()
-                }
-            }
+            "chat_room_id": chat_room.id,
+            "room_id": chat_room.id
         }, status=201)
         
     except User.DoesNotExist:
         return Response({"error": "Student not found"}, status=404)
     except Exception as e:
         return Response({"error": f"Failed to start chat: {str(e)}"}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def dormitory_send_message(request):
+    """Send a message from dormitory staff"""
+    if request.user.role != 'dormitory':
+        return Response({"error": "Unauthorized"}, status=403)
+    
+    return send_message(request) 
 
 # ==================== STUDENT CHAT ENDPOINTS ====================
 
@@ -4469,7 +6955,7 @@ def send_chat_message_unified(request):
 
 
 
-# ==================== LIBRARIAN CHAT VIEWS ====================
+# ==================== LIBRARIAN CHAT ENDPOINTS ====================
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -4505,7 +6991,7 @@ def librarian_get_chat_rooms(request):
             "student_id": student.id if student else None,
             "student_name": student.get_full_name() if student else "Unknown Student",
             "student_email": student.email if student else None,
-            "last_message": last_message.content if last_message else "",
+            "last_message": last_message.content[:100] if last_message else "",
             "last_message_time": room.last_message_time,
             "unread_count": unread_count,
             "created_at": room.created_at
@@ -4540,14 +7026,20 @@ def librarian_get_chat_messages(request, room_id):
             formatted_messages.append({
                 "id": message.id,
                 "content": message.content,
+                "message_type": message.message_type,
                 "sender": {
                     "id": message.sender.id if message.sender else None,
                     "username": message.sender.username if message.sender else None,
                     "name": message.sender.get_full_name() if message.sender else None,
                     "role": message.sender.role if message.sender else None
                 },
+                "image_file": message.image_file.url if message.image_file else None,
+                "audio_file": message.audio_file.url if message.audio_file else None,
+                "video_file": message.video_file.url if message.video_file else None,
                 "file": message.file.url if message.file else None,
-                "file_name": message.file.name if message.file else None,
+                "file_name": message.file_name,
+                "file_size": message.file_size,
+                "duration": message.duration,
                 "is_read": message.is_read,
                 "created_at": message.created_at,
                 "is_own": message.sender == user
@@ -5284,6 +7776,12 @@ def verify_payment(request, payment_id):
         department_map = {
             'librarian': 'library',
             'cafeteria': 'cafeteria',
+            'psychology': 'psychology',
+            'sportmaster': 'sportmaster',
+            'campuspolice': 'campuspolice',
+            'cooperationsharing': 'cooperationsharing',
+            'dopcordinator': 'dopcordinator',
+            'studentaffairs': 'studentaffairs',
             'dormitory': 'dormitory'
         }
         
@@ -5320,8 +7818,7 @@ def verify_payment(request, payment_id):
                 # Notify student
                 Notification.objects.create(
                     user=payment.student,
-                    message=f"Your payment of {payment.amount} ETB has been VERIFIED by {request.user.role}. "
-                           f"Transaction ID: {payment.transaction_id}"
+                    message=f"Your payment of {payment.amount} ETB has been VERIFIED by {request.user.get_full_name() or request.user.username} ({request.user.role}). Transaction ID: {payment.transaction_id}"
                 )
                 
                 # ============ AUTO-UPDATE CLEARANCE FORM ============
@@ -5346,8 +7843,7 @@ def verify_payment(request, payment_id):
                 # Notify student
                 Notification.objects.create(
                     user=payment.student,
-                    message=f"Your payment of {payment.amount} ETB has been REJECTED by {request.user.role}. "
-                           f"Reason: {note}. Transaction ID: {payment.transaction_id}"
+                    message=f"Your payment of {payment.amount} ETB has been REJECTED by {request.user.get_full_name() or request.user.username} ({request.user.role}). Reason: {note}. Transaction ID: {payment.transaction_id}"
                 )
                 
                 message_text = "Payment rejected"
@@ -5359,7 +7855,11 @@ def verify_payment(request, payment_id):
                 "message": message_text,
                 "payment_id": payment.id,
                 "status": payment.status,
-                "verified_by": request.user.username,
+                "verified_by": {
+                    "username": request.user.username,
+                    "full_name": request.user.get_full_name(),
+                    "role": request.user.role
+                },
                 "verified_at": payment.verified_at,
                 "rejection_reason": payment.rejection_reason if payment.status == 'rejected' else None,
                 "clearance_updated": action == 'verify'
@@ -5378,28 +7878,78 @@ def auto_update_clearance_form(payment):
     try:
         student = payment.student
         department_type = payment.department_type
+        verified_by = payment.verified_by
         
-        # Map payment department to clearance form department
+        # Map payment department to clearance form fields
         department_status_map = {
             'library': {
                 'status_field': 'requires_library_payment',
                 'next_status': 'approved_library',
-                'note_field': 'library_note'
+                'note_field': 'library_note',
+                'approved_by_field': 'library_approved_by',
+                'role_name': 'Librarian'
             },
             'cafeteria': {
                 'status_field': 'requires_cafeteria_payment',
                 'next_status': 'approved_cafeteria',
-                'note_field': 'cafeteria_note'
+                'note_field': 'cafeteria_note',
+                'approved_by_field': 'cafeteria_approved_by',
+                'role_name': 'Cafeteria Manager'
+            },
+            'psychology': {
+                'status_field': 'requires_psychology_payment',
+                'next_status': 'approved_psychology',
+                'note_field': 'psychology_note',
+                'approved_by_field': 'psychology_approved_by',
+                'role_name': 'Psychology'
+            },
+            'sportmaster': {
+                'status_field': 'requires_sportmaster_payment',
+                'next_status': 'approved_sportmaster',
+                'note_field': 'sportmaster_note',
+                'approved_by_field': 'sportmaster_approved_by',
+                'role_name': 'Sport Master'
+            },
+            'campuspolice': {
+                'status_field': 'requires_campuspolice_payment',
+                'next_status': 'approved_campuspolice',
+                'note_field': 'campuspolice_note',
+                'approved_by_field': 'campuspolice_approved_by',
+                'role_name': 'Campus Police'
+            },
+            'cooperationsharing': {
+                'status_field': 'requires_cooperationsharing_payment',
+                'next_status': 'approved_cooperationsharing',
+                'note_field': 'cooperationsharing_note',
+                'approved_by_field': 'cooperationsharing_approved_by',
+                'role_name': 'Cooperation Sharing'
+            },
+            'dopcordinator': {
+                'status_field': 'requires_dopcordinator_payment',
+                'next_status': 'approved_dopcordinator',
+                'note_field': 'dopcordinator_note',
+                'approved_by_field': 'dopcordinator_approved_by',
+                'role_name': 'DOP Cordinator'
+            },
+            'studentaffairs': {
+                'status_field': 'requires_studentaffairs_payment',
+                'next_status': 'approved_studentaffairs',
+                'note_field': 'studentaffairs_note',
+                'approved_by_field': 'studentaffairs_approved_by',
+                'role_name': 'Student Affairs'
             },
             'dormitory': {
                 'status_field': 'requires_dormitory_payment',
                 'next_status': 'approved_dormitory',
-                'note_field': 'dormitory_note'
+                'note_field': 'dormitory_note',
+                'approved_by_field': 'dormitory_approved_by',
+                'role_name': 'Dormitory Manager'
             }
         }
         
         dept_info = department_status_map.get(department_type)
         if not dept_info:
+            print(f"ERROR: No department info for {department_type}")
             return False
         
         # Find forms that need payment for this department
@@ -5409,76 +7959,116 @@ def auto_update_clearance_form(payment):
         ).order_by('-created_at')
         
         if not forms.exists():
-            # Also check regular pending status if payment is made proactively
-            if department_type == 'library':
+            # Check alternative status if payment is made proactively
+            alt_status_map = {
+                'library': 'approved_department',
+                'cafeteria': 'approved_library',
+                'psychology': 'approved_cafeteria',
+                'sportmaster': 'approved_psychology',
+                'campuspolice': 'approved_sportmaster',
+                'cooperationsharing': 'approved_campuspolice',
+                'dopcordinator': 'approved_cooperationsharing',
+                'studentaffairs': 'approved_dopcordinator',
+                'dormitory': 'approved_studentaffairs'
+            }
+            alt_status = alt_status_map.get(department_type)
+            if alt_status:
                 forms = ClearanceForm.objects.filter(
                     student=student,
-                    status='approved_department'
-                ).order_by('-created_at')
-            elif department_type == 'cafeteria':
-                forms = ClearanceForm.objects.filter(
-                    student=student,
-                    status='approved_library'
-                ).order_by('-created_at')
-            elif department_type == 'dormitory':
-                forms = ClearanceForm.objects.filter(
-                    student=student,
-                    status='approved_cafeteria'
+                    status=alt_status
                 ).order_by('-created_at')
         
         if not forms.exists():
+            print(f"ERROR: No forms found for student {student.id} with department {department_type}")
             return False
         
         # Update the latest form
         form = forms.first()
+        print(f"Updating form #{form.id} for {department_type} payment")
         
-        # Update form status and note
+        # Create approval name with role
+        if verified_by:
+            staff_name = verified_by.get_full_name() or verified_by.username
+            approval_name = f"{staff_name} ({dept_info['role_name']})"
+        else:
+            approval_name = f"System ({dept_info['role_name']})"
+        
+        print(f"Setting approval name: '{approval_name}' for field: {dept_info['approved_by_field']}")
+        
+        # Update form status and approval fields
         form.status = dept_info['next_status']
+        
+        # Set the approved_by field
+        if hasattr(form, dept_info['approved_by_field']):
+            setattr(form, dept_info['approved_by_field'], approval_name)
+            print(f"✓ Set {dept_info['approved_by_field']} = {approval_name}")
+        else:
+            print(f"✗ Field {dept_info['approved_by_field']} does not exist on form")
+        
+        # Set the note
         setattr(form, dept_info['note_field'], 
-                f"Payment verified. Transaction: {payment.transaction_id}")
+                f"Payment verified. Transaction: {payment.transaction_id} | Amount: {payment.amount} ETB")
+        
         form.updated_at = timezone.now()
         form.save()
+        
+        # Verify the field was saved
+        updated_form = ClearanceForm.objects.get(id=form.id)
+        saved_value = getattr(updated_form, dept_info['approved_by_field'], None)
+        print(f"Verification - saved value: '{saved_value}'")
         
         # Create notification for student
         Notification.objects.create(
             user=student,
-            message=f"✅ Your clearance form #{form.id} has been approved by {department_type} after payment verification.",
-            clearance_form=form
+            message=f"✅ Your clearance form #{form.id} has been approved by {dept_info['role_name']} after payment verification.",
+            clearance_form=form,
+            notification_type="success"
         )
         
         # Send notification to next department
-        send_next_department_notification(payment, form)
+        send_next_department_notification(form)
         
         return True
         
     except Exception as e:
+        print(f"Error in auto_update_clearance_form: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
-def send_next_department_notification(payment, form):
-    """Send notification to next department after payment verification"""
+def send_next_department_notification(form):
+    """Send notification to next department after approval"""
     try:
+        # Map current status to next department
         next_dept_map = {
-            'library': {'role': 'cafeteria', 'name': 'Cafeteria'},
-            'cafeteria': {'role': 'dormitory', 'name': 'Dormitory'},
-            'dormitory': {'role': 'registrar', 'name': 'Registrar'}
+            'approved_department': ('librarian', 'Library'),
+            'approved_library': ('cafeteria', 'Cafeteria'),
+            'approved_cafeteria': ('psychology', 'Psychology'),
+            'approved_psychology': ('sportmaster', 'Sport Master'),
+            'approved_sportmaster': ('campuspolice', 'Campus Police'),
+            'approved_campuspolice': ('cooperationsharing', 'Cooperation Sharing'),
+            'approved_cooperationsharing': ('dopcordinator', 'DOP Cordinator'),
+            'approved_dopcordinator': ('studentaffairs', 'Student Affairs'),
+            'approved_studentaffairs': ('dormitory', 'Dormitory'),
+            'approved_dormitory': ('registrar', 'Registrar')
         }
         
-        next_dept = next_dept_map.get(payment.department_type)
-        if next_dept:
-            staff_users = User.objects.filter(
-                role=next_dept['role'], 
-                is_active=True
-            )
+        next_info = next_dept_map.get(form.status)
+        if next_info:
+            role, dept_name = next_info
+            staff_users = User.objects.filter(role=role, is_active=True)
             for staff in staff_users:
                 Notification.objects.create(
                     user=staff,
-                    message=f"📋 New clearance form #{form.id} from {form.student.username} ready for {next_dept['name']} check",
+                    message=f"📋 New clearance form #{form.id} from {form.student.username if form.student else form.full_name} ready for {dept_name} review",
                     notification_type="info",
                     clearance_form=form
                 )
+            print(f"✓ Notified {staff_users.count()} {role}(s) about form #{form.id}")
+        
     except Exception as e:
-        pass
+        print(f"Error in send_next_department_notification: {e}")
 
 
 @api_view(['GET'])
@@ -6108,6 +8698,96 @@ class ToggleAuthorizedStudentView(APIView):
             return Response({"error": "Student not found"}, status=404)
 
 
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def verify_student_by_id(request):
+    """Verify student by ID only and return their information"""
+    try:
+        id_number = request.data.get('id_number', '').strip()
+        
+        if not id_number:
+            return Response({
+                "error": "Student ID is required",
+                "details": "Please enter your student ID"
+            }, status=400)
+        
+        print(f"Looking for student with ID: {id_number}")
+        
+        # Find authorized student by ID only
+        authorized_student = AuthorizedStudent.objects.filter(
+            id_number=id_number,
+            is_active=True,
+            is_registered=False
+        ).select_related('college', 'department').first()
+        
+        if authorized_student:
+            print(f"Found student: {authorized_student.first_name} {authorized_student.last_name}")
+            
+            # Return student information
+            return Response({
+                "success": True,
+                "message": "Student verified successfully",
+                "student": {
+                    "id": authorized_student.id,
+                    "first_name": authorized_student.first_name,
+                    "last_name": authorized_student.last_name,
+                    "id_number": authorized_student.id_number,
+                    "email": authorized_student.email,
+                    "college": authorized_student.college.name if authorized_student.college else None,
+                    "college_id": authorized_student.college.id if authorized_student.college else None,
+                    "department": authorized_student.department.name if authorized_student.department else None,
+                    "department_id": authorized_student.department.id if authorized_student.department else None,
+                    "is_registered": authorized_student.is_registered,
+                    "is_active": authorized_student.is_active,
+                }
+            })
+        else:
+            print(f"No student found with ID: {id_number}")
+            
+            # Check if student exists but is already registered
+            registered_student = AuthorizedStudent.objects.filter(
+                id_number=id_number,
+                is_registered=True
+            ).first()
+            
+            if registered_student:
+                return Response({
+                    "error": "Already registered",
+                    "details": f"This student ID is already registered for {registered_student.first_name} {registered_student.last_name}",
+                    "suggestions": "Please use the login page to access your account."
+                }, status=400)
+            
+            # Check if student exists but inactive
+            inactive_student = AuthorizedStudent.objects.filter(
+                id_number=id_number,
+                is_active=False
+            ).exists()
+            
+            if inactive_student:
+                return Response({
+                    "error": "Account inactive",
+                    "details": "This student account is not active",
+                    "suggestions": "Contact your department administrator to activate your account."
+                }, status=400)
+            
+            # No student found
+            return Response({
+                "error": "Student not found",
+                "details": f"No student found with ID: {id_number}",
+                "suggestions": "Please check your student ID and try again. If the problem persists, contact your department."
+            }, status=404)
+            
+    except Exception as e:
+        print(f"Error in verify_student_by_id: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        return Response({
+            "error": "Internal server error",
+            "details": str(e),
+            "suggestions": "Please try again later or contact support."
+        }, status=500)
+
 class CSVUploadListView(APIView):
     permission_classes = [IsAuthenticated, IsAdminUserRole]
     
@@ -6376,6 +9056,12 @@ def get_pending_payments_api(request):
     department_map = {
         'librarian': 'library',
         'cafeteria': 'cafeteria',
+        'psychology': 'psychology',
+        'sportmaster': 'sportmaster',
+        'campuspolice': 'campuspolice',
+        'cooperationsharing': 'cooperationsharing',
+        'dopcordinator': 'dopcordinator',
+        'studentaffairs': 'studentaffairs',
         'dormitory': 'dormitory'
     }
     
@@ -6399,6 +9085,12 @@ def get_verified_payments_api(request):
     department_map = {
         'librarian': 'library',
         'cafeteria': 'cafeteria',
+        'psychology': 'psychology',
+        'sportmaster': 'sportmaster',
+        'campuspolice': 'campuspolice',
+        'cooperationsharing': 'cooperationsharing',
+        'dopcordinator': 'dopcordinator',
+        'studentaffairs': 'studentaffairs',
         'dormitory': 'dormitory'
     }
     
@@ -6503,3 +9195,965 @@ def get_chat_messages_api(request, room_id):
 def send_chat_message_api(request):
     """Alias for send_chat_message_unified for backward compatibility"""
     return send_chat_message_unified(request)
+
+# ==================== ADD THESE TO YOUR EXISTING views.py ====================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_cafeteria_staff(request):
+    """Get available cafeteria staff for students to chat with"""
+    if request.user.role != 'student':
+        return Response({"error": "Only students can access this"}, status=403)
+    
+    cafeteria_staff = User.objects.filter(role='cafeteria', is_active=True).first()
+    
+    return Response({
+        'role': 'cafeteria',
+        'display_name': 'Cafeteria',
+        'room_type': 'student_cafeteria',
+        'available': cafeteria_staff is not None,
+        'staff': {
+            'id': cafeteria_staff.id if cafeteria_staff else None,
+            'name': cafeteria_staff.get_full_name() if cafeteria_staff else None,
+            'email': cafeteria_staff.email if cafeteria_staff else None
+        } if cafeteria_staff else None,
+        'icon': '🍽️',
+        'description': 'Chat about meal dues and cafeteria issues'
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_students_for_cafeteria(request):
+    """Get students for cafeteria staff to chat with"""
+    if request.user.role != 'cafeteria':
+        return Response({"error": "Unauthorized - Cafeteria only"}, status=403)
+    
+    cafeteria_staff = request.user
+    students = User.objects.filter(
+        role='student',
+        is_active=True
+    ).order_by('first_name', 'last_name')[:50]  # Limit for performance
+    
+    result = []
+    for student in students:
+        # Check if chat already exists
+        existing_chat = ChatRoom.objects.filter(
+            student=student,
+            specific_staff=cafeteria_staff,
+            room_type='student_cafeteria',
+            is_active=True
+        ).first()
+        
+        # Get unread count if chat exists
+        unread_count = 0
+        if existing_chat:
+            unread_count = existing_chat.messages.filter(
+                is_read=False
+            ).exclude(sender=cafeteria_staff).count()
+        
+        result.append({
+            'id': student.id,
+            'full_name': student.get_full_name() or student.username,
+            'username': student.username,
+            'email': student.email,
+            'id_number': getattr(student, 'id_number', 'N/A'),
+            'department': student.department.name if student.department else None,
+            'has_existing_chat': existing_chat is not None,
+            'chat_room_id': existing_chat.id if existing_chat else None,
+            'unread_count': unread_count,
+            'last_message_time': existing_chat.last_message_time if existing_chat else None
+        })
+    
+    return Response({
+        'staff_name': cafeteria_staff.get_full_name() or cafeteria_staff.username,
+        'total_students': len(result),
+        'students': result
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def start_cafeteria_chat(request):
+    """Start a chat between student and cafeteria - FIXED VERSION"""
+    user = request.user
+    student_id = request.data.get('student_id')
+    
+    print(f"Starting cafeteria chat: user_role={user.role}, student_id={student_id}")
+    
+    # Determine who is starting the chat
+    if user.role == 'student':
+        # Student starting chat with cafeteria
+        student = user
+        cafeteria_staff = User.objects.filter(role='cafeteria', is_active=True).first()
+        
+        if not cafeteria_staff:
+            return Response({"error": "No cafeteria staff available"}, status=404)
+            
+    elif user.role == 'cafeteria':
+        # Cafeteria staff starting chat with student
+        cafeteria_staff = user
+        if not student_id:
+            return Response({"error": "Student ID required"}, status=400)
+            
+        try:
+            student = User.objects.get(id=student_id, role='student')
+        except User.DoesNotExist:
+            return Response({"error": "Student not found"}, status=404)
+    else:
+        return Response({"error": "Unauthorized"}, status=403)
+    
+    # Check if chat already exists
+    existing_chat = ChatRoom.objects.filter(
+        student=student,
+        specific_staff=cafeteria_staff,
+        room_type='student_cafeteria',
+        is_active=True
+    ).first()
+    
+    if existing_chat:
+        # Get the last message
+        last_msg = existing_chat.messages.last()
+        return Response({
+            "message": "Chat already exists",
+            "chat_room": {
+                "id": existing_chat.id,
+                "name": existing_chat.name,
+                "room_type": existing_chat.room_type,
+                "student": {
+                    "id": student.id,
+                    "name": student.get_full_name() or student.username,
+                    "email": student.email,
+                    "id_number": getattr(student, 'id_number', 'N/A')
+                },
+                "staff": {
+                    "id": cafeteria_staff.id,
+                    "name": cafeteria_staff.get_full_name() or cafeteria_staff.username,
+                    "role": cafeteria_staff.role
+                },
+                "last_message": last_msg.content if last_msg else "",
+                "last_message_time": existing_chat.last_message_time,
+                "created_at": existing_chat.created_at,
+                "unread_count": existing_chat.messages.filter(is_read=False).exclude(sender=user).count()
+            }
+        })
+    
+    # Create new chat room
+    if user.role == 'student':
+        room_name = f"{student.get_full_name() or student.username} - Cafeteria"
+    else:
+        room_name = f"Cafeteria - {student.get_full_name() or student.username}"
+    
+    print(f"Creating new chat room: {room_name}")
+    
+    chat_room = ChatRoom.objects.create(
+        name=room_name,
+        room_type='student_cafeteria',
+        student=student,
+        specific_staff=cafeteria_staff,
+        is_active=True
+    )
+    
+    # Add participants
+    chat_room.participants.add(student, cafeteria_staff)
+    
+    # Create welcome message
+    if user.role == 'student':
+        welcome_content = f"Hello, I need assistance with cafeteria clearance."
+        sender = student
+    else:
+        welcome_content = f"Hello {student.get_full_name() or student.username}! This is {cafeteria_staff.get_full_name() or cafeteria_staff.username} from Cafeteria. How can I help you with your meal dues?"
+        sender = cafeteria_staff
+    
+    welcome_msg = Message.objects.create(
+        room=chat_room,
+        sender=sender,
+        message_type='text',
+        content=welcome_content
+    )
+    
+    chat_room.last_message_time = welcome_msg.created_at
+    chat_room.save()
+    
+    # Create notification for the other participant
+    other_participant = cafeteria_staff if user.role == 'student' else student
+    Notification.objects.create(
+        user=other_participant,
+        title="New Chat Started",
+        message=f"{sender.get_full_name() or sender.username} started a chat with you.",
+        notification_type='chat'
+    )
+    
+    return Response({
+        "message": "Chat started successfully",
+        "chat_room": {
+            "id": chat_room.id,
+            "name": chat_room.name,
+            "room_type": chat_room.room_type,
+            "student": {
+                "id": student.id,
+                "name": student.get_full_name() or student.username,
+                "email": student.email,
+                "id_number": getattr(student, 'id_number', 'N/A')
+            },
+            "staff": {
+                "id": cafeteria_staff.id,
+                "name": cafeteria_staff.get_full_name() or cafeteria_staff.username,
+                "role": cafeteria_staff.role
+            },
+            "last_message": welcome_msg.content,
+            "last_message_time": chat_room.last_message_time,
+            "created_at": chat_room.created_at,
+            "unread_count": 0
+        }
+    }, status=201)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_cafeteria_chat_messages(request, room_id):
+    """Get messages for a specific cafeteria chat room - FIXED VERSION"""
+    try:
+        chat_room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        # Check if user is a participant
+        if user not in chat_room.participants.all():
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        # Mark unread messages as read (excluding user's own messages)
+        Message.objects.filter(
+            room=chat_room,
+            is_read=False
+        ).exclude(sender=user).update(is_read=True)
+        
+        # Get messages
+        messages = chat_room.messages.all().order_by('created_at')
+        
+        # Format messages
+        formatted_messages = []
+        for message in messages:
+            msg_data = {
+                "id": message.id,
+                "content": message.content,
+                "message_type": message.message_type,
+                "sender": {
+                    "id": message.sender.id if message.sender else None,
+                    "username": message.sender.username if message.sender else None,
+                    "full_name": message.sender.get_full_name() if message.sender else None,
+                    "role": message.sender.role if message.sender else None
+                },
+                "is_read": message.is_read,
+                "created_at": message.created_at,
+                "is_own": message.sender == user
+            }
+            
+            # Add file URLs if present
+            if message.image_file:
+                msg_data["image_file"] = message.image_file.url
+            if message.audio_file:
+                msg_data["audio_file"] = message.audio_file.url
+            if message.video_file:
+                msg_data["video_file"] = message.video_file.url
+            if message.file:
+                msg_data["file"] = message.file.url
+                msg_data["file_name"] = message.file_name
+                msg_data["file_size"] = message.file_size
+            if message.thumbnail:
+                msg_data["thumbnail"] = message.thumbnail.url
+            
+            formatted_messages.append(msg_data)
+        
+        # Get room info
+        room_info = {
+            "id": chat_room.id,
+            "name": chat_room.name,
+            "room_type": chat_room.room_type,
+            "student": {
+                "id": chat_room.student.id if chat_room.student else None,
+                "name": chat_room.student.get_full_name() if chat_room.student else None,
+                "email": chat_room.student.email if chat_room.student else None,
+                "id_number": getattr(chat_room.student, 'id_number', 'N/A') if chat_room.student else 'N/A'
+            } if chat_room.student else None,
+            "staff": {
+                "id": chat_room.specific_staff.id if chat_room.specific_staff else None,
+                "name": chat_room.specific_staff.get_full_name() if chat_room.specific_staff else None,
+                "role": chat_room.specific_staff.role if chat_room.specific_staff else None
+            } if chat_room.specific_staff else None
+        }
+        
+        return Response({
+            'room': room_info,
+            'messages': formatted_messages,
+            'total_messages': messages.count()
+        })
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+    except Exception as e:
+        print(f"Error getting chat messages: {e}")
+        return Response({"error": str(e)}, status=500)
+@api_view(['POST'])
+
+
+@permission_classes([IsAuthenticated])
+def send_cafeteria_message(request):
+    """Send a message in cafeteria chat - FIXED VERSION"""
+    room_id = request.data.get('room_id')
+    content = request.data.get('content')
+    
+    if not room_id:
+        return Response({"error": "room_id required"}, status=400)
+    
+    if not content:
+        return Response({"error": "Message content required"}, status=400)
+    
+    try:
+        chat_room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        # Check if user is a participant
+        if user not in chat_room.participants.all():
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        # Create message
+        message = Message.objects.create(
+            room=chat_room,
+            sender=user,
+            content=content,
+            message_type='text'
+        )
+        
+        # Update room's last message time
+        chat_room.last_message_time = message.created_at
+        chat_room.save(update_fields=['last_message_time'])
+        
+        # Create notification for other participants
+        other_participants = chat_room.participants.exclude(id=user.id)
+        
+        for participant in other_participants:
+            Notification.objects.create(
+                user=participant,
+                title=f"New message from {user.get_full_name() or user.username}",
+                message=content[:100],
+                notification_type='chat'
+            )
+        
+        # Prepare response
+        response_data = {
+            "id": message.id,
+            "content": message.content,
+            "message_type": message.message_type,
+            "sender": {
+                "id": user.id,
+                "username": user.username,
+                "full_name": user.get_full_name() or user.username,
+                "role": user.role
+            },
+            "is_read": message.is_read,
+            "created_at": message.created_at,
+            "is_own": True
+        }
+        
+        return Response(response_data, status=201)
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_cafeteria_chat_rooms(request):
+    """Get chat rooms for cafeteria staff - FIXED VERSION"""
+    if request.user.role != 'cafeteria':
+        return Response({"error": "Unauthorized - Cafeteria only"}, status=403)
+    
+    user = request.user
+    
+    # Get chat rooms where user is a participant
+    rooms = ChatRoom.objects.filter(
+        participants=user,
+        room_type='student_cafeteria',
+        is_active=True
+    ).distinct().order_by('-last_message_time')
+    
+    result = []
+    for room in rooms:
+        last_msg = room.messages.last()
+        unread_count = room.messages.filter(is_read=False).exclude(sender=user).count()
+        
+        # Get student info
+        student = room.student
+        if not student:
+            # Try to find student from participants
+            student = room.participants.filter(role='student').first()
+        
+        result.append({
+            "id": room.id,
+            "name": room.name,
+            "room_type": room.room_type,
+            "last_message": last_msg.content[:100] if last_msg else "",
+            "last_message_time": room.last_message_time,
+            "unread_count": unread_count,
+            "student": {
+                "id": student.id if student else None,
+                "name": student.get_full_name() if student else "Unknown Student",
+                "username": student.username if student else "unknown",
+                "email": student.email if student else "",
+                "id_number": getattr(student, 'id_number', 'N/A') if student else 'N/A'
+            } if student else None,
+            "created_at": room.created_at
+        })
+    
+    return Response(result)
+# ==================== DORMITORY CHAT ENDPOINTS ====================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_dormitory_chat_rooms(request):
+    """Get chat rooms for dormitory staff"""
+    if request.user.role != 'dormitory':
+        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    
+    user = request.user
+    rooms = ChatRoom.objects.filter(
+        Q(specific_staff=user) | Q(participants=user),
+        room_type='student_dormitory',
+        is_active=True
+    ).distinct().order_by('-last_message_time')
+    
+    result = []
+    for room in rooms:
+        last_msg = room.messages.last()
+        unread_count = room.messages.filter(is_read=False).exclude(sender=user).count()
+        
+        # Get student info
+        student = room.student
+        if not student:
+            # Try to find student from participants
+            student = room.participants.filter(role='student').first()
+        
+        result.append({
+            "id": room.id,
+            "name": room.name,
+            "last_message": last_msg.content[:100] if last_msg else "",
+            "last_message_time": room.last_message_time,
+            "unread_count": unread_count,
+            "student": {
+                "id": student.id if student else None,
+                "name": student.get_full_name() if student else "Unknown Student",
+                "username": student.username if student else "unknown",
+                "email": student.email if student else "",
+                "id_number": getattr(student, 'id_number', 'N/A') if student else 'N/A'
+            } if student else None,
+            "created_at": room.created_at
+        })
+    
+    return Response(result)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_dormitory_chat_messages(request, room_id):
+    """Get messages for a dormitory chat room"""
+    try:
+        room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        # Check if user is a participant
+        if user not in room.participants.all():
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        # Mark messages as read
+        room.messages.filter(is_read=False).exclude(sender=user).update(is_read=True)
+        
+        messages = room.messages.all().order_by('created_at')
+        
+        result = []
+        for msg in messages:
+            msg_data = {
+                "id": msg.id,
+                "content": msg.content,
+                "message_type": msg.message_type,
+                "sender": {
+                    "id": msg.sender.id,
+                    "username": msg.sender.username,
+                    "full_name": msg.sender.get_full_name(),
+                    "role": msg.sender.role
+                },
+                "is_read": msg.is_read,
+                "created_at": msg.created_at,
+                "is_own": msg.sender == user
+            }
+            
+            # Add file URLs if present
+            if msg.image_file:
+                msg_data["image_file"] = msg.image_file.url
+            if msg.audio_file:
+                msg_data["audio_file"] = msg.audio_file.url
+            if msg.video_file:
+                msg_data["video_file"] = msg.video_file.url
+            if msg.file:
+                msg_data["file"] = msg.file.url
+                msg_data["file_name"] = msg.file_name
+                msg_data["file_size"] = msg.file_size
+            if msg.thumbnail:
+                msg_data["thumbnail"] = msg.thumbnail.url
+            
+            result.append(msg_data)
+        
+        return Response({
+            "room_id": room.id,
+            "room_name": room.name,
+            "messages": result,
+            "total_messages": len(result)
+        })
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def start_dormitory_chat(request):
+    """Start a new chat between dormitory staff and student"""
+    if request.user.role != 'dormitory':
+        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    
+    student_id = request.data.get('student_id')
+    
+    if not student_id:
+        return Response({"error": "Student ID is required"}, status=400)
+    
+    try:
+        # Get the student
+        student = User.objects.get(id=student_id, role='student', is_active=True)
+        dormitory_staff = request.user
+        
+        # Check if chat already exists
+        existing_chat = ChatRoom.objects.filter(
+            Q(student=student) | Q(participants=student),
+            Q(specific_staff=dormitory_staff) | Q(participants=dormitory_staff),
+            room_type='student_dormitory',
+            is_active=True
+        ).first()
+        
+        if existing_chat:
+            return Response({
+                "message": "Chat already exists",
+                "chat_room": {
+                    "id": existing_chat.id,
+                    "name": existing_chat.name,
+                    "room_type": existing_chat.room_type
+                },
+                "existing": True
+            })
+        
+        # Create new chat room
+        room_name = f"{student.get_full_name() or student.username} - Dormitory"
+        
+        chat_room = ChatRoom.objects.create(
+            name=room_name,
+            room_type='student_dormitory',
+            student=student,
+            specific_staff=dormitory_staff,
+            is_active=True
+        )
+        
+        # Add participants
+        chat_room.participants.add(student, dormitory_staff)
+        
+        # Create welcome message
+        welcome_content = f"Hello {student.get_full_name() or student.username}! This is {dormitory_staff.get_full_name() or dormitory_staff.username} from Dormitory. How can I help you with your clearance?"
+        
+        welcome_msg = Message.objects.create(
+            room=chat_room,
+            sender=dormitory_staff,
+            message_type='text',
+            content=welcome_content
+        )
+        
+        chat_room.last_message_time = welcome_msg.created_at
+        chat_room.save()
+        
+        # Create notification for student
+        Notification.objects.create(
+            user=student,
+            title="New Chat from Dormitory",
+            message=f"{dormitory_staff.get_full_name() or dormitory_staff.username} from Dormitory started a chat with you.",
+            notification_type='chat'
+        )
+        
+        return Response({
+            "message": "Chat started successfully",
+            "chat_room": {
+                "id": chat_room.id,
+                "name": chat_room.name,
+                "room_type": chat_room.room_type,
+                "student": {
+                    "id": student.id,
+                    "name": student.get_full_name() or student.username,
+                    "email": student.email,
+                    "id_number": getattr(student, 'id_number', 'N/A')
+                },
+                "staff": {
+                    "id": dormitory_staff.id,
+                    "name": dormitory_staff.get_full_name() or dormitory_staff.username,
+                    "role": dormitory_staff.role
+                },
+                "last_message": welcome_msg.content,
+                "last_message_time": chat_room.last_message_time,
+                "created_at": chat_room.created_at
+            }
+        }, status=201)
+        
+    except User.DoesNotExist:
+        return Response({"error": "Student not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def send_dormitory_message(request):
+    """Send a message in dormitory chat"""
+    room_id = request.data.get('room_id')
+    content = request.data.get('content')
+    
+    if not room_id:
+        return Response({"error": "room_id is required"}, status=400)
+    
+    if not content:
+        return Response({"error": "Message content is required"}, status=400)
+    
+    try:
+        room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        # Check if user is a participant
+        if user not in room.participants.all():
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        # Create message
+        message = Message.objects.create(
+            room=room,
+            sender=user,
+            content=content,
+            message_type='text'
+        )
+        
+        # Update room's last message time
+        room.last_message_time = message.created_at
+        room.save(update_fields=['last_message_time'])
+        
+        # Create notification for the other participant
+        other_participant = room.student if user.role == 'dormitory' else room.specific_staff
+        
+        if other_participant:
+            Notification.objects.create(
+                user=other_participant,
+                title=f"New message from {user.get_full_name() or user.username}",
+                message=content[:100],
+                notification_type='chat'
+            )
+        
+        # Prepare response
+        response_data = {
+            "id": message.id,
+            "content": message.content,
+            "message_type": message.message_type,
+            "sender": {
+                "id": user.id,
+                "username": user.username,
+                "full_name": user.get_full_name(),
+                "role": user.role
+            },
+            "is_read": message.is_read,
+            "created_at": message.created_at,
+            "is_own": True
+        }
+        
+        return Response(response_data, status=201)
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser])
+def upload_dormitory_file(request):
+    """Upload a file in dormitory chat"""
+    room_id = request.data.get('room_id')
+    message_type = request.data.get('message_type', 'file')
+    
+    if not room_id:
+        return Response({"error": "room_id is required"}, status=400)
+    
+    try:
+        room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        # Check if user is a participant
+        if user not in room.participants.all():
+            return Response({"error": "You are not a participant in this chat"}, status=403)
+        
+        message_data = {
+            'room': room,
+            'sender': user,
+            'message_type': message_type
+        }
+        
+        # Handle different file types
+        if message_type == 'image':
+            if 'image_file' in request.FILES:
+                image_file = request.FILES['image_file']
+                message_data['image_file'] = image_file
+                message_data['file_name'] = image_file.name
+                message_data['file_size'] = image_file.size
+                
+                # Generate thumbnail
+                try:
+                    from PIL import Image
+                    from io import BytesIO
+                    from django.core.files.base import ContentFile
+                    
+                    img = Image.open(image_file)
+                    img.thumbnail((200, 200))
+                    thumb_io = BytesIO()
+                    img.save(thumb_io, format='JPEG', quality=85)
+                    
+                    message_data['thumbnail'] = ContentFile(
+                        thumb_io.getvalue(),
+                        name=f"thumb_{image_file.name}"
+                    )
+                except Exception as e:
+                    print(f"Thumbnail generation failed: {e}")
+                    
+        elif message_type == 'audio':
+            if 'audio_file' in request.FILES:
+                audio_file = request.FILES['audio_file']
+                message_data['audio_file'] = audio_file
+                message_data['file_name'] = audio_file.name
+                message_data['file_size'] = audio_file.size
+                
+        elif message_type == 'video':
+            if 'video_file' in request.FILES:
+                video_file = request.FILES['video_file']
+                message_data['video_file'] = video_file
+                message_data['file_name'] = video_file.name
+                message_data['file_size'] = video_file.size
+                
+        else:  # file
+            if 'file' in request.FILES:
+                file_obj = request.FILES['file']
+                message_data['file'] = file_obj
+                message_data['file_name'] = file_obj.name
+                message_data['file_size'] = file_obj.size
+        
+        # Create message
+        message = Message.objects.create(**message_data)
+        
+        # Update room's last message time
+        room.last_message_time = message.created_at
+        room.save(update_fields=['last_message_time'])
+        
+        # Create notification for other participant
+        other_participant = room.student if user.role == 'dormitory' else room.specific_staff
+        
+        if other_participant:
+            Notification.objects.create(
+                user=other_participant,
+                title=f"New {message_type} from {user.get_full_name() or user.username}",
+                message=f"Sent a {message_type}",
+                notification_type='chat'
+            )
+        
+        # Prepare response
+        response_data = {
+            "id": message.id,
+            "message_type": message.message_type,
+            "sender": {
+                "id": user.id,
+                "username": user.username,
+                "full_name": user.get_full_name(),
+                "role": user.role
+            },
+            "is_read": message.is_read,
+            "created_at": message.created_at,
+            "is_own": True
+        }
+        
+        if message.image_file:
+            response_data["image_file"] = message.image_file.url
+        if message.audio_file:
+            response_data["audio_file"] = message.audio_file.url
+        if message.video_file:
+            response_data["video_file"] = message.video_file.url
+        if message.file:
+            response_data["file"] = message.file.url
+        if message.file_name:
+            response_data["file_name"] = message.file_name
+        if message.file_size:
+            response_data["file_size"] = message.file_size
+        if message.thumbnail:
+            response_data["thumbnail"] = message.thumbnail.url
+        
+        return Response(response_data, status=201)
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+    except Exception as e:
+        return Response({"error": str(e)}, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_dormitory_students_for_chat(request):
+    """Get list of students for dormitory staff to chat with"""
+    if request.user.role != 'dormitory':
+        return Response({"error": "Unauthorized - Dormitory only"}, status=403)
+    
+    dormitory_staff = request.user
+    
+    # Get all active students
+    students = User.objects.filter(
+        role='student',
+        is_active=True
+    ).order_by('first_name', 'last_name')[:100]  # Limit for performance
+    
+    result = []
+    for student in students:
+        # Check if chat already exists
+        existing_chat = ChatRoom.objects.filter(
+            student=student,
+            specific_staff=dormitory_staff,
+            room_type='student_dormitory',
+            is_active=True
+        ).first()
+        
+        # Get unread count if chat exists
+        unread_count = 0
+        if existing_chat:
+            unread_count = existing_chat.messages.filter(
+                is_read=False
+            ).exclude(sender=dormitory_staff).count()
+        
+        result.append({
+            'id': student.id,
+            'full_name': student.get_full_name() or student.username,
+            'username': student.username,
+            'email': student.email,
+            'id_number': getattr(student, 'id_number', 'N/A'),
+            'department': student.department.name if student.department else None,
+            'has_existing_chat': existing_chat is not None,
+            'chat_room_id': existing_chat.id if existing_chat else None,
+            'unread_count': unread_count,
+            'last_message_time': existing_chat.last_message_time if existing_chat else None
+        })
+    
+    return Response({
+        'staff_name': dormitory_staff.get_full_name() or dormitory_staff.username,
+        'total_students': len(result),
+        'students': result
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def mark_dormitory_messages_read(request, room_id):
+    """Mark all messages in a room as read"""
+    try:
+        room = ChatRoom.objects.get(id=room_id, is_active=True)
+        user = request.user
+        
+        if user not in room.participants.all():
+            return Response({"error": "Not a participant"}, status=403)
+        
+        updated_count = room.messages.filter(
+            is_read=False
+        ).exclude(sender=user).update(is_read=True)
+        
+        return Response({
+            "message": f"Marked {updated_count} messages as read",
+            "count": updated_count
+        })
+        
+    except ChatRoom.DoesNotExist:
+        return Response({"error": "Chat room not found"}, status=404)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_dormitory_message(request, message_id):
+    """Delete a message"""
+    try:
+        message = Message.objects.get(id=message_id)
+        
+        if message.sender != request.user:
+            return Response({"error": "You can only delete your own messages"}, status=403)
+        
+        # Delete associated files
+        if message.image_file:
+            message.image_file.delete(save=False)
+        if message.audio_file:
+            message.audio_file.delete(save=False)
+        if message.video_file:
+            message.video_file.delete(save=False)
+        if message.file:
+            message.file.delete(save=False)
+        if message.thumbnail:
+            message.thumbnail.delete(save=False)
+        
+        message.delete()
+        
+        return Response({"message": "Message deleted successfully"})
+        
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_dormitory_file(request, message_id):
+    """Download a file from a message"""
+    try:
+        message = Message.objects.get(id=message_id)
+        user = request.user
+        
+        if user not in message.room.participants.all():
+            return Response({"error": "Unauthorized"}, status=403)
+        
+        # Determine which file to download
+        file_field = None
+        if message.file:
+            file_field = message.file
+        elif message.image_file:
+            file_field = message.image_file
+        elif message.audio_file:
+            file_field = message.audio_file
+        elif message.video_file:
+            file_field = message.video_file
+        
+        if not file_field:
+            return Response({"error": "No file found"}, status=404)
+        
+        file_path = file_field.path
+        if not os.path.exists(file_path):
+            return Response({"error": "File not found"}, status=404)
+        
+        response = FileResponse(
+            open(file_path, 'rb'),
+            content_type='application/octet-stream'
+        )
+        filename = message.file_name or os.path.basename(file_path)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+        
+    except Message.DoesNotExist:
+        return Response({"error": "Message not found"}, status=404)

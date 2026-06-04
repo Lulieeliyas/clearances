@@ -49,6 +49,12 @@ class User(AbstractUser):
         ('departmenthead', 'Department Head'),
         ('librarian', 'Librarian'),
         ('cafeteria', 'Cafeteria'),
+        ('psychology', 'Psychology'),
+        ('sportmaster', 'Sport Master'),
+        ('campuspolice', 'Campus Police'),
+        ('coastsharing', 'Coast Sharing'),
+        ('dopcoordinator', 'DOP Coordinator'),
+        ('studentaffairs', 'Student Affairs'),
         ('dormitory', 'Dormitory'),
         ('registrar', 'Registrar'),
         ('admin', 'Admin'),
@@ -66,6 +72,20 @@ class User(AbstractUser):
     )
     created_at = models.DateTimeField(default=timezone.now)
     
+    building = models.ForeignKey(
+        'Building',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='building_students',  # Changed from 'students' to avoid clash
+        help_text="Dormitory building assigned to the student"
+    )
+    assigned_buildings = models.ManyToManyField(
+        'Building',
+        blank=True,
+        related_name='assigned_staff',  # Changed from 'dormitory_staff' to avoid clash
+        help_text="Buildings this dormitory staff member manages"
+    )
     # Profile fields
     profile_picture = models.ImageField(upload_to='profile_pictures/', blank=True, null=True, verbose_name='Profile Picture')
     last_password_change = models.DateTimeField(
@@ -77,6 +97,7 @@ class User(AbstractUser):
     updated_at = models.DateTimeField(auto_now=True)
     objects = UserManager()
     is_blocked = models.BooleanField(default=False)
+    email = models.EmailField(unique=True)
 
 
     def get_profile_picture_url(self):
@@ -145,6 +166,9 @@ class User(AbstractUser):
     def save(self, *args, **kwargs):
         self.is_active = not self.is_blocked
         super().save(*args, **kwargs)
+        if self.role == 'dormitory':
+                # You might want to add validation here
+            pass
 
     def __str__(self):
         return f"{self.username} ({self.role})"
@@ -157,6 +181,36 @@ class User(AbstractUser):
     class Meta:
         ordering = ['-date_joined']
 
+# In models.py - Update Building class
+
+class Building(models.Model):
+    """Represents a physical dormitory building"""
+    name = models.CharField(max_length=100, unique=True)
+    code = models.CharField(max_length=20, unique=True, help_text="Building code (e.g., BLK-A, D-101)")
+    address = models.CharField(max_length=200, blank=True, null=True)
+    capacity = models.IntegerField(default=0, help_text="Maximum number of students")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+    
+    def get_assigned_staff_count(self):
+        """Get count of dormitory staff assigned to this building"""
+        return self.assigned_staff.filter(role='dormitory', is_active=True).count()
+    
+    def get_student_count(self):
+        """Get count of students assigned to this building"""
+        return self.building_students.filter(is_active=True).count()
+    
+    def get_available_capacity(self):
+        """Get available capacity"""
+        if self.capacity == 0:
+            return "Unlimited"
+        return max(0, self.capacity - self.get_student_count())
+    
+    class Meta:
+        ordering = ['name']
 # ======================================================
 # CLEARANCE FORM
 # ======================================================
@@ -184,13 +238,27 @@ class ClearanceForm(models.Model):
         ('approved_department', 'Approved by Department'),
         ('approved_library', 'Approved by Library'),
         ('approved_cafeteria', 'Approved by Cafeteria'),
+        ('approved_psychology', 'Approved by Psychology'),
+        ('approved_sportmaster', 'Approved by Sport Master'),
+        ('approved_campuspolice', 'Approved by Campus Police'),
+        ('approved_cooperationsharing', 'Approved by Cooperation Sharing'),
+        ('approved_dopcordinator', 'Approved by DOP Cordinator'), 
+        ('approved_studentaffairs', 'Approved by Student Affairs'),
         ('approved_dormitory', 'Approved by Dormitory'),
         ('Cleared by Registrar', 'Cleared by Registrar'),
         ('rejected', 'Rejected'),
         ('pending_resubmission', 'Pending Resubmission'),
 
+
+ # Payment required statuses
         ('requires_library_payment', 'Requires Library Payment'),
         ('requires_cafeteria_payment', 'Requires Cafeteria Payment'),
+        ('requires_psychology_payment', 'Requires Psychology Payment'),
+        ('requires_sportmaster_payment', 'Requires Sport Master Payment'),
+        ('requires_campuspolice_payment', 'Requires Campus Police Payment'),
+        ('requires_cooperationsharing_payment', 'Requires Cooperation Sharing Payment'),
+        ('requires_dopcordinator_payment', 'Requires DOP Cordinator Payment'),
+        ('requires_studentaffairs_payment', 'Requires Student Affairs Payment'),
         ('requires_dormitory_payment', 'Requires Dormitory Payment'),
     ]
 
@@ -212,9 +280,29 @@ class ClearanceForm(models.Model):
     year = models.CharField(max_length=5, choices=YEAR_CHOICES)
     semester = models.CharField(max_length=5, choices=SEMESTER_CHOICES)
     reason = models.TextField()
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="pending_department")
 
-    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default="pending_department")
-
+# Building information for the student - FIXED related_name
+    student_building = models.ForeignKey(
+        'Building',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='form_buildings',  # Changed from 'clearance_forms' to avoid clash
+        help_text="Building where the student resides"
+    )
+    student_building_code = models.CharField(
+        max_length=20, 
+        blank=True, 
+        null=True,
+        help_text="Building code for quick filtering"
+    )
+    assigned_buildings = models.ManyToManyField(
+        'Building',
+        blank=True,
+        related_name='dormitory_staff',
+        help_text="Buildings this dormitory staff member manages"
+    )
     # Department notes
     department_note = models.TextField(blank=True, null=True)
     library_note = models.TextField(blank=True, null=True)
@@ -233,9 +321,39 @@ class ClearanceForm(models.Model):
     cafeteria_approved_by = models.CharField(max_length=255, null=True, blank=True)
     cafeteria_approved_at = models.DateTimeField(null=True, blank=True)
 
+    psychology_approved_by = models.CharField(max_length=255, null=True, blank=True)
+    psychology_approved_at = models.DateTimeField(null=True, blank=True)
+    psychology_note = models.TextField(blank=True, null=True)
+
+
+    sportmaster_approved_by = models.CharField(max_length=255, null=True, blank=True)
+    sportmaster_approved_at = models.DateTimeField(null=True, blank=True)
+    sportmaster_note = models.TextField(blank=True, null=True)
+
+    campuspolice_approved_by = models.CharField(max_length=255, null=True, blank=True)
+    campuspolice_approved_at = models.DateTimeField(null=True, blank=True)
+    campuspolice_note = models.TextField(blank=True, null=True)
+
+    cooperationsharing_approved_by = models.CharField(max_length=255, null=True, blank=True)
+    cooperationsharing_approved_at = models.DateTimeField(null=True, blank=True)
+    cooperationsharing_note = models.TextField(blank=True, null=True)
+
+
+    # DOP Coordinator
+    dopcoordinator_approved_by = models.CharField(max_length=255, null=True, blank=True)  # FIXED: consistent name
+    dopcoordinator_approved_at = models.DateTimeField(null=True, blank=True)
+    dopcoordinator_note = models.TextField(blank=True, null=True)
+
+
+    studentaffairs_approved_by = models.CharField(max_length=255, null=True, blank=True)
+    studentaffairs_approved_at = models.DateTimeField(null=True, blank=True)
+    studentaffairs_note = models.TextField(blank=True, null=True)
+
+
 # Dormitory
     dormitory_approved_by = models.CharField(max_length=255, null=True, blank=True)
     dormitory_approved_at = models.DateTimeField(null=True, blank=True)
+
 
 # Registrar
     registrar_approved_by = models.CharField(max_length=255, null=True, blank=True)
@@ -287,6 +405,12 @@ class SystemControl(models.Model):
     is_department_head_open = models.BooleanField(default=True, verbose_name="Department Head Module")
     is_librarian_open = models.BooleanField(default=True, verbose_name="Librarian Module")
     is_cafeteria_open = models.BooleanField(default=True, verbose_name="Cafeteria Module")
+    is_psychology_open = models.BooleanField(default=True, verbose_name="Psychology Module")
+    is_sportmaster_open = models.BooleanField(default=True, verbose_name="Sport Master Module")
+    is_campuspolice_open = models.BooleanField(default=True, verbose_name="Campus Police Module")
+    is_coastsharing_open = models.BooleanField(default=True, verbose_name="Coast Sharing Module")
+    is_dopcoordinator_open = models.BooleanField(default=True, verbose_name="DOP Coordinator Module")
+    is_studentaffairs_open = models.BooleanField(default=True, verbose_name="Student Affairs Module")
     is_dormitory_open = models.BooleanField(default=True, verbose_name="Dormitory Module")
     is_registrar_open = models.BooleanField(default=True, verbose_name="Registrar Module")
     is_student_open = models.BooleanField(default=True, verbose_name="Student Module")
@@ -318,18 +442,23 @@ class SystemControl(models.Model):
 
     @classmethod
     def get_module_status(cls, module_name):
-        """Get specific module status"""
         obj = cls.objects.first()
         if not obj:
-            return True  # default open
+            return True
         
         if not obj.is_open:
-            return False  # If system closed, all modules closed
+            return False
         
         module_map = {
             'departmenthead': 'is_department_head_open',
             'librarian': 'is_librarian_open',
             'cafeteria': 'is_cafeteria_open',
+            'psychology': 'is_psychology_open',
+            'sportmaster': 'is_sportmaster_open',
+            'campuspolice': 'is_campuspolice_open',
+            'coastsharing': 'is_coastsharing_open',
+            'dopcoordinator': 'is_dopcoordinator_open',
+            'studentaffairs': 'is_studentaffairs_open',
             'dormitory': 'is_dormitory_open',
             'registrar': 'is_registrar_open',
             'student': 'is_student_open',
@@ -500,11 +629,40 @@ class ChatRoom(models.Model):
 
 
 class Message(models.Model):
+    MESSAGE_TYPES = [
+        ('text', 'Text'),
+        ('image', 'Image'),
+        ('audio', 'Audio'),
+        ('video', 'Video'),
+        ('file', 'File'),
+    ]
+    
     room = models.ForeignKey(ChatRoom, on_delete=models.CASCADE, related_name='messages')
     sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sent_messages')
-    content = models.TextField()
+    content = models.TextField(blank=True, null=True)
+    message_type = models.CharField(max_length=20, choices=MESSAGE_TYPES, default='text')
+    
+    # File fields
     file = models.FileField(upload_to='chat_files/', null=True, blank=True)
+    audio_file = models.FileField(upload_to='chat_audio/', null=True, blank=True)
+    video_file = models.FileField(upload_to='chat_video/', null=True, blank=True)
+    image_file = models.ImageField(upload_to='chat_images/', null=True, blank=True)
+    
+    # File metadata
+    file_name = models.CharField(max_length=255, blank=True, null=True)
+    file_size = models.IntegerField(default=0)  # Size in bytes
+    duration = models.FloatField(null=True, blank=True)  # For audio/video duration in seconds
+    thumbnail = models.ImageField(upload_to='chat_thumbnails/', null=True, blank=True)  # For video thumbnails
+    
+    # Read status
     is_read = models.BooleanField(default=False)
+    read_by = models.ManyToManyField(User, related_name='read_messages', blank=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+    
+    # Reply to
+    reply_to = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='replies')
+    
+    # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -512,15 +670,34 @@ class Message(models.Model):
         ordering = ['created_at']
 
     def __str__(self):
-        return f"Message from {self.sender.username} in {self.room.name}"
+        return f"{self.message_type} from {self.sender.username} in {self.room.name}"
 
-    def mark_as_read(self):
-        self.is_read = True
-        self.save()
+    def mark_as_read(self, user):
+        """Mark message as read by a specific user"""
+        if user not in self.read_by.all():
+            self.read_by.add(user)
+            
+        # If all participants have read it, mark as read
+        all_participants = self.room.participants.all()
+        if all([p in self.read_by.all() for p in all_participants]):
+            self.is_read = True
+            self.read_at = timezone.now()
+            self.save()
+        else:
+            self.save()
 
-        
-        # In your models.py, add these models
-# In your PaymentMethod model in models.py
+    def get_file_url(self):
+        """Get file URL based on message type"""
+        if self.message_type == 'audio' and self.audio_file:
+            return self.audio_file.url
+        elif self.message_type == 'video' and self.video_file:
+            return self.video_file.url
+        elif self.message_type == 'image' and self.image_file:
+            return self.image_file.url
+        elif self.file:
+            return self.file.url
+        return None
+
 class PaymentMethod(models.Model):
     """University payment methods - Customizable by admins"""
     # Remove the fixed METHOD_CHOICES and make name a free text field
@@ -575,6 +752,12 @@ class StudentPayment(models.Model):
         choices=[
             ('library', 'Library'),
             ('cafeteria', 'Cafeteria'),
+            ('psychology', 'Psychology'),
+            ('sportmaster', 'Sport Master'),
+            ('campuspolice', 'Campus Police'),
+            ('coastsharing', 'Coast Sharing'),
+            ('dopcoordinator', 'DOP Coordinator'),
+            ('studentaffairs', 'Student Affairs'),
             ('dormitory', 'Dormitory'),
             ('other', 'Other'),
         ]
@@ -775,10 +958,7 @@ class PaymentVerificationLog(models.Model):
     
     def __str__(self):
         return f"{self.payment.transaction_id} - {self.action}"
-    
-    
-    
-    
+
 
 # In your models.py, add after PaymentVerificationLog model
 

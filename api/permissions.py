@@ -1,5 +1,6 @@
 from rest_framework.permissions import BasePermission
 from rest_framework import permissions
+from api.models import SystemControl
 class IsAdminUserRole(permissions.BasePermission):
     
     def has_permission(self, request, view):
