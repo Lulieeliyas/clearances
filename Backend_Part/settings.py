@@ -56,11 +56,6 @@ ASGI_APPLICATION = "Backend_Part.asgi.application"
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels.layers.InMemoryChannelLayer',
-        # For production, use Redis:
-        # 'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        # 'CONFIG': {
-        #     "hosts": [('127.0.0.1', 6379)],
-        # },
     },
 }
 
@@ -109,23 +104,6 @@ TEMPLATES = [
 # WSGI APPLICATION
 # -------------------------------
 WSGI_APPLICATION = 'Backend_Part.wsgi.application'
-
-# -------------------------------
-# DATABASE
-# -------------------------------
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.mysql',
-#         'NAME': 'university_clearance',    # create MySQL database
-#         'USER': 'ucs_user',                # create MySQL username
-#         'PASSWORD': 'StrongPassword123!',  # create MySQL password
-#         'HOST': 'localhost',               # Usually localhost
-#         'PORT': '3306',                    # MySQL default port
-#         'OPTIONS': {
-#             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-#         },
-#     }
-# }
 
 DATABASES = {
     'default': {
