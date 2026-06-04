@@ -10,6 +10,9 @@ import pymysql
 pymysql.install_as_MySQLdb()
 
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # -------------------------------
 # BASE DIR (must be defined first)
 # -------------------------------
@@ -112,7 +115,7 @@ DATABASES = {
         'USER': os.environ.get('DB_USER'),
         'PASSWORD': os.environ.get('DB_PASSWORD'),
         'HOST': os.environ.get('DB_HOST'),
-        'PORT': os.environ.get('DB_PORT'),
+        'PORT': os.environ.get('DB_PORT', '3306'),
     }
 }
 
