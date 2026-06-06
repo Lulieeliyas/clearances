@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: clearance-backend
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn Backend_Part.wsgi:application"
