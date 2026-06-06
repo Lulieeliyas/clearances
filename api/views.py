@@ -60,7 +60,6 @@ from io import BytesIO
 from django.db import transaction
 from django.core.files.storage import default_storage
 from django.http import HttpResponse
-from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import io
