@@ -10,9 +10,6 @@ import pymysql
 pymysql.install_as_MySQLdb()
 
 
-from dotenv import load_dotenv
-load_dotenv()
-
 # -------------------------------
 # BASE DIR (must be defined first)
 # -------------------------------
@@ -24,11 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', get_random_secret_key())
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = [
-    "localhost",
-    "127.0.0.1",
-    ".onrender.com",
-]
+ALLOWED_HOSTS = ["127.0.0.1", "localhost", "0.0.0.0"]
 
 # -------------------------------
 # APPLICATION DEFINITION
@@ -59,6 +52,11 @@ ASGI_APPLICATION = "Backend_Part.asgi.application"
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        # For production, use Redis:
+        # 'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        # 'CONFIG': {
+        #     "hosts": [('127.0.0.1', 6379)],
+        # },
     },
 }
 
@@ -75,7 +73,6 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'api.middleware.SystemOpenMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
 
 ]
 
@@ -108,14 +105,20 @@ TEMPLATES = [
 # -------------------------------
 WSGI_APPLICATION = 'Backend_Part.wsgi.application'
 
+# -------------------------------
+# DATABASE
+# -------------------------------
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('DB_NAME'),
-        'USER': os.environ.get('DB_USER'),
-        'PASSWORD': os.environ.get('DB_PASSWORD'),
-        'HOST': os.environ.get('DB_HOST'),
-        'PORT': os.environ.get('DB_PORT', '3306'),
+        'NAME': 'university_clearance',    # create MySQL database
+        'USER': 'ucs_user',                # create MySQL username
+        'PASSWORD': 'StrongPassword123!',  # create MySQL password
+        'HOST': 'localhost',               # Usually localhost
+        'PORT': '3306',                    # MySQL default port
+        'OPTIONS': {
+            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+        },
     }
 }
 
@@ -154,9 +157,6 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_DIRS = [
     BASE_DIR / 'static',
 ]
-STATICFILES_STORAGE = (
-    "whitenoise.storage.CompressedManifestStaticFilesStorage"
-)
 
 # -------------------------------
 # MEDIA FILES
@@ -274,11 +274,8 @@ EMAIL_PORT = 465
 EMAIL_USE_SSL = True
 EMAIL_USE_TLS = False
 
-# EMAIL_HOST_USER = 'lulieeliyas@gmail.com'
-# EMAIL_HOST_PASSWORD = 'vqtu wcgh rwqb ikwl'
-
-EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER")
-EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD")
+EMAIL_HOST_USER = 'lulieeliyas@gmail.com'
+EMAIL_HOST_PASSWORD = 'vqtu wcgh rwqb ikwl'
 
 DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 SERVER_EMAIL = EMAIL_HOST_USER
