@@ -1,6 +1,30 @@
 services:
   - type: web
-    name: clearance-backend
-    env: python
-    buildCommand: "./build.sh"
-    startCommand: "gunicorn Backend_Part.wsgi:application"
+    name: clearances
+    runtime: python
+    repo: https://github.com/Lulieeliyas/clearances
+    plan: free
+    region: oregon
+    buildCommand: |
+      pip install -r requirements.txt
+      python manage.py collectstatic --noinput
+    startCommand: gunicorn Backend_Part.wsgi:application
+    envVars:
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_DEBUG
+        value: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clearances-db
+          property: connectionString
+      - key: EMAIL_HOST_USER
+        sync: false
+      - key: EMAIL_HOST_PASSWORD
+        sync: false
+
+databases:
+  - name: clearances-db
+    databaseName: clearances
+    plan: free
+    region: oregon
