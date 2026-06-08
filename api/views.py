@@ -1509,6 +1509,39 @@ University Clearance System
     })
 
 
+@csrf_exempt
+def health_check(request):
+    """Health check endpoint for Render"""
+    try:
+        # Check database connection
+        user_count = User.objects.count()
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return JsonResponse({
+        'status': 'healthy',
+        'database': db_status,
+        'timestamp': datetime.now().isoformat(),
+        'environment': 'production' if not DEBUG else 'development'
+    })
+
+@csrf_exempt
+def root_endpoint(request):
+    """Root endpoint with API information"""
+    return JsonResponse({
+        'name': 'University Clearance System API',
+        'version': '1.0.0',
+        'status': 'running',
+        'endpoints': {
+            'api': '/api/',
+            'admin': '/admin/',
+            'health': '/health/',
+            'docs': '/api/docs/'
+        }
+    })
+
+
 # ==================== CAFETERIA VIEWS ====================
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])

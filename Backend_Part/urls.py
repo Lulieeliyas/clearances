@@ -3,6 +3,7 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from django.http import HttpResponse
+from api.views import health_check, root_endpoint
 
 
 def home(request):
@@ -18,6 +19,7 @@ def home(request):
 
 urlpatterns = [
     path('', home, name='home'),
+    path('health/', health_check, name='health_check'),
     path('admin/', admin.site.urls),
     path('api/', include('api.urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

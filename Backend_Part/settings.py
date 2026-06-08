@@ -20,13 +20,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECURITY & DEBUG
 # -------------------------------
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', get_random_secret_key())
-DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'  # Changed to False by default
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [
     "127.0.0.1",
     "localhost",
     ".onrender.com",
     "clearances.onrender.com",
+    "https://clearances.onrender.com",
 ]
 
 # -------------------------------
@@ -61,7 +62,7 @@ CHANNEL_LAYERS = {
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',  # Important for static files
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -100,61 +101,35 @@ TEMPLATES = [
 WSGI_APPLICATION = 'Backend_Part.wsgi.application'
 
 # -------------------------------
-# DATABASE - FIXED VERSION
+# DATABASE - FIXED FOR RENDER
 # -------------------------------
-# Get database URL from environment
+import dj_database_url
+
+# Get database URL from environment (Render provides this automatically)
 database_url = os.environ.get('DATABASE_URL')
 
 if database_url:
-    # Use PostgreSQL (Render.com default)
-    print(f"Using DATABASE_URL: {database_url[:30]}...")
+    # For PostgreSQL on Render
     DATABASES = {
         'default': dj_database_url.config(
             default=database_url,
             conn_max_age=600,
             conn_health_checks=True,
-            ssl_require=True
+            ssl_require=False  # Don't force SSL for internal connections
         )
     }
+    print(f"✅ Connected to PostgreSQL database")
 else:
-    # Fallback to MySQL or SQLite for local development
-    db_engine = os.environ.get('DB_ENGINE', 'sqlite')
-    
-    if db_engine == 'mysql' and all([
-        os.environ.get('DB_NAME'),
-        os.environ.get('DB_USER'),
-        os.environ.get('DB_PASSWORD'),
-        os.environ.get('DB_HOST')
-    ]):
-        # Use MySQL
-        import pymysql
-        pymysql.install_as_MySQLdb()
-        
-        DATABASES = {
-            'default': {
-                'ENGINE': 'django.db.backends.mysql',
-                'NAME': os.environ.get('DB_NAME'),
-                'USER': os.environ.get('DB_USER'),
-                'PASSWORD': os.environ.get('DB_PASSWORD'),
-                'HOST': os.environ.get('DB_HOST'),
-                'PORT': os.environ.get('DB_PORT', '3306'),
-                'OPTIONS': {
-                    'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-                    'charset': 'utf8mb4',
-                },
-            }
+    # Fallback to SQLite for local development
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
         }
-    else:
-        # Use SQLite for local development
-        print("Using SQLite database for development")
-        DATABASES = {
-            'default': {
-                'ENGINE': 'django.db.backends.sqlite3',
-                'NAME': BASE_DIR / 'db.sqlite3',
-            }
-        }
+    }
+    print(f"⚠️ Using SQLite database for development")
 
-print(f"Database engine: {DATABASES['default']['ENGINE']}")
+print(f"📊 Database engine: {DATABASES['default']['ENGINE']}")
 
 # -------------------------------
 # PASSWORD VALIDATION
@@ -217,15 +192,15 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 AUTH_USER_MODEL = 'api.User'
 
 # -------------------------------
-# CORS SETTINGS
+# CORS SETTINGS - FIXED
 # -------------------------------
-CORS_ALLOW_ALL_ORIGINS = True  # For development only
+CORS_ALLOW_ALL_ORIGINS = False  # Changed to False for security
 CORS_ALLOW_CREDENTIALS = True
+
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
+    "https://clearances-frontend.vercel.app",
     "https://clearances.onrender.com",
 ]
 
@@ -294,19 +269,29 @@ SIMPLE_JWT = {
 }
 
 # -------------------------------
-# EMAIL SETTINGS
+# EMAIL SETTINGS - FIXED
 # -------------------------------
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 465
-EMAIL_USE_SSL = True
-EMAIL_USE_TLS = False
+if DEBUG:
+    # Use console backend for development
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+    print("📧 Using console email backend for development")
+else:
+    # Use SMTP for production only if credentials exist
+    if os.environ.get("EMAIL_HOST_USER") and os.environ.get("EMAIL_HOST_PASSWORD"):
+        EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+        EMAIL_HOST = 'smtp.gmail.com'
+        EMAIL_PORT = 587
+        EMAIL_USE_TLS = True
+        EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER")
+        EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD")
+        print("📧 Configured SMTP email backend")
+    else:
+        # Fallback to console if no email credentials
+        EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+        print("⚠️ Warning: No email credentials found. Using console email backend.")
 
-EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
-EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
-
-DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
-SERVER_EMAIL = EMAIL_HOST_USER
+DEFAULT_FROM_EMAIL = os.environ.get("EMAIL_HOST_USER", "noreply@clearances.com")
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
 EMAIL_TIMEOUT = 20
 
 # -------------------------------
@@ -316,7 +301,7 @@ SESSION_COOKIE_AGE = 1209600
 SESSION_SAVE_EVERY_REQUEST = True
 SESSION_COOKIE_SECURE = not DEBUG
 SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SAMESITE = 'Lax' if DEBUG else 'Strict'
+SESSION_COOKIE_SAMESITE = 'Lax'
 
 # -------------------------------
 # SECURITY SETTINGS
