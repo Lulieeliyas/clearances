@@ -1541,7 +1541,47 @@ def root_endpoint(request):
         }
     })
 
+# Add this to your views.py after your existing views
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated, IsAdminUserRole])
+def admin_dashboard_stats(request):
+    """Get all stats for admin dashboard"""
+    try:
+        stats = {
+            'total_users': User.objects.count(),
+            'active_departments': Department.objects.filter(is_active=True).count() if hasattr(Department, 'is_active') else Department.objects.count(),
+            'total_colleges': College.objects.count(),
+            'total_forms': ClearanceForm.objects.count(),
+            'approved_forms': ClearanceForm.objects.filter(status__in=['Cleared by Registrar', 'completed']).count(),
+            'pending_forms': ClearanceForm.objects.filter(status__icontains='pending').count(),
+            'rejected_forms': ClearanceForm.objects.filter(status='rejected').count(),
+            'efficiency': 0,
+            'avg_processing_time': "0",
+            'today_forms': ClearanceForm.objects.filter(created_at__date=timezone.now().date()).count(),
+            'weekly_trend': "+0%"
+        }
+        
+        # Calculate efficiency
+        if stats['total_forms'] > 0:
+            stats['efficiency'] = round((stats['approved_forms'] / stats['total_forms']) * 100, 2)
+        
+        return Response(stats)
+    except Exception as e:
+        print(f"Error in admin_dashboard_stats: {e}")
+        return Response({
+            'total_users': 0,
+            'active_departments': 0,
+            'total_colleges': 0,
+            'total_forms': 0,
+            'approved_forms': 0,
+            'pending_forms': 0,
+            'rejected_forms': 0,
+            'efficiency': 0,
+            'avg_processing_time': "0",
+            'today_forms': 0,
+            'weekly_trend': "+0%"
+        })
 # ==================== CAFETERIA VIEWS ====================
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])

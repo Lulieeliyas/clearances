@@ -200,9 +200,10 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://clearances-frontend.vercel.app",
+    "https://clearances-frontend.vercel.app",  # Add this exactly
     "https://clearances.onrender.com",
 ]
+
 
 CORS_ALLOW_METHODS = [
     'DELETE',

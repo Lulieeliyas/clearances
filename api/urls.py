@@ -11,7 +11,7 @@ from .views import (
     cooperationsharing_forms, cooperationsharing_action,
     dopcordinator_forms, dopcordinator_action,
     studentaffairs_forms, studentaffairs_action,get_active_buildings,building_list, building_detail,
-    assign_dormitory_staff_buildings, export_building_stats,get_staff_with_buildings,get_unassigned_dormitory_staff,get_building_staff,get_staff_by_building,debug_building_assignments,UserDetailView
+    assign_dormitory_staff_buildings, export_building_stats,get_staff_with_buildings,get_unassigned_dormitory_staff,admin_create_user,get_building_staff,get_staff_by_building,debug_building_assignments,UserDetailView,admin_dashboard_stats,get_all_payment_methods_admin,create_payment_method,update_payment_method,delete_payment_method,admin_get_all_payments,AuthorizedStudentListView,CSVUploadView,CSVUploadListView
 )
 router = DefaultRouter()
 router.register(r'system-controls', views.SystemControlViewSet, basename='system-control')
@@ -309,6 +309,19 @@ path('chat/staff/rooms/', views.get_chat_rooms_by_role, name='staff-chat-rooms')
 path('chat/staff/students/', views.get_students_for_staff, name='staff-students'),
 path('chat/staff/start/', views.staff_start_chat_with_student, name='staff-start-chat'),
 
+
+
+    path('admin/stats/', admin_dashboard_stats, name='admin_stats'),
+    path('admin/payment-methods/', get_all_payment_methods_admin, name='admin_payment_methods'),
+    path('admin/payment-methods/create/', create_payment_method, name='create_payment_method'),
+    path('admin/payment-methods/<int:method_id>/', update_payment_method, name='update_payment_method'),
+    path('admin/payment-methods/<int:method_id>/delete/', delete_payment_method, name='delete_payment_method'),
+    path('admin/payments/all/', admin_get_all_payments, name='admin_all_payments'),
+    path('admin/authorized-students/', AuthorizedStudentListView.as_view(), name='authorized_students'),
+    path('admin/csv-upload/', CSVUploadView.as_view(), name='csv_upload'),
+    path('admin/csv-uploads/', CSVUploadListView.as_view(), name='csv_uploads'),
+    path('admin/create-user/', admin_create_user, name='admin_create_user'),
+    
 # Messages
 path('chat/messages/<int:room_id>/', views.get_chat_messages, name='chat-messages'),
 path('chat/send/', views.send_message, name='send-message'),
