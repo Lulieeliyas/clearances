@@ -28,6 +28,8 @@ ALLOWED_HOSTS = [
     ".onrender.com",
     "clearances.onrender.com",
     "https://clearances.onrender.com",
+    "clearances-frontend.vercel.app",
+     ".vercel.app",
 ]
 
 # -------------------------------
@@ -202,6 +204,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "https://clearances-frontend.vercel.app",  # Add this exactly
     "https://clearances.onrender.com",
+    "https://clearances-frontend-git-main.vercel.app", # Add preview deployments
+    "https://clearances-frontend.vercel.app",
 ]
 
 
